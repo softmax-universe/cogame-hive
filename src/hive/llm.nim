@@ -290,6 +290,14 @@ proc needsBackoff(open: seq[int],
       return true
   false
 
+proc holdFallbackDoctrine*(): ResolvedDoctrine =
+  ## Neutral recall/hold doctrine for scored LLM failures (never `skMarcher`).
+  ResolvedDoctrine(
+    doctrine: Doctrine(recall: true),
+    source: dsFallback,
+    latencyMs: 0
+  )
+
 proc decideAll*(
   client: LlmClient,
   match: Sim,
@@ -316,18 +324,23 @@ proc decideAll*(
   for seat in 0 ..< Colonies:
     if external[seat]:
       discard
-    elif scripted[seat] != skNone or client.disabled or prompts[seat].len == 0:
+    elif scripted[seat] != skNone:
       result[seat] = SeatOutcome(
-        resolved: scriptedResolved(views[seat],
-          (if scripted[seat] == skNone: skMarcher else: scripted[seat]),
-          turn, memory[seat]),
-        cause: (if scripted[seat] != skNone: "" else: "no_credentials"),
+        resolved: scriptedResolved(views[seat], scripted[seat], turn, memory[seat]),
+        cause: "",
+        detail: "",
+        attempts: 0
+      )
+    elif client.disabled or prompts[seat].len == 0:
+      result[seat] = SeatOutcome(
+        resolved: holdFallbackDoctrine(),
+        cause: "no_credentials",
         detail: "",
         attempts: 0
       )
     elif models[seat].len > 0 and client.transport == ltBedrock:
       result[seat] = SeatOutcome(
-        resolved: scriptedResolved(views[seat], skMarcher, turn, memory[seat], dsFallback),
+        resolved: holdFallbackDoctrine(),
         cause: "provider_error", detail: "Per-seat model selection requires the sidecar or Anthropic transport",
         attempts: 0)
     else:
@@ -443,6 +456,5 @@ proc decideAll*(
           "per-turn deadline of " & $client.turnBudgetSeconds &
           "s expired before this seat could be asked", MaxDetailRunes)
         result[seat].attempts = max(1, result[seat].attempts)
-    echo "hive llm: seat ", seat, " falling back to the scripted doctrine"
-    result[seat].resolved = scriptedResolved(views[seat], skMarcher, turn,
-      memory[seat], dsFallback)
+    echo "hive llm: seat ", seat, " falling back to neutral hold doctrine"
+    result[seat].resolved = holdFallbackDoctrine()
