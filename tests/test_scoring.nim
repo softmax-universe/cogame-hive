@@ -83,12 +83,11 @@ proc main() =
     var causes: array[Colonies, array[8, int]]
     let results = resultsJson(faulted, @["a", "b", "c", "d"],
       @["llm", "llm", "scripted", "scripted"], turnsLlm, fallbackTurns, causes)
-    var total = 0.0
     for seat in 0 ..< Colonies:
-      checkEqual(results["scores"][seat].getFloat(), 0.25,
-        "a fault scores 0.25 for every seat")
-      total += results["scores"][seat].getFloat()
-    checkEqual(total, 1.0, "a fault still sums to 1.0")
+      checkEqual(results["scores"][seat].kind, JNull,
+        "a fault leaves every seat unscored (null, no numeric score)")
+      checkEqual(results["win"][seat].getBool(), false,
+        "a fault awards no win")
     checkEqual(results["winner"].kind, JNull, "a fault has no winner")
     checkEqual(results["reason"].getStr(), "fault", "reason")
     checkEqual(results["end_rule"].getStr(), "sim_fault", "end_rule")

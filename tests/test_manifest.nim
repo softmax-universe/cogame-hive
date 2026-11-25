@@ -79,28 +79,46 @@ proc main() =
       "the game receives no inference credential")
     ## Bundled players live at the TOP level, not under `game`.
     check(not game.hasKey("player"), "game.player must NOT exist")
-    check(manifest.hasKey("player") and manifest["player"].len >= 1,
-      "the manifest declares at least one bundled player")
-    let bundled = manifest["player"][0]
-    checkEqual(bundled["id"].getStr(), "baseline", "the bundled player id")
+    check(manifest.hasKey("player") and manifest["player"].len >= 2,
+      "the manifest declares the native model player and the scripted baseline")
+    let nativeModel = manifest["player"][0]
+    checkEqual(nativeModel["id"].getStr(), "llm",
+      "the first bundled player is the native model player")
+    checkEqual(nativeModel["type"].getStr(), "player", "its role type")
+    check(nativeModel["name"].getStr().len > 0, "native model player has a name")
+    check(nativeModel["description"].getStr().len > 0, "and a description")
+    checkEqual(nativeModel["run"][0].getStr(), "/bin/hive-player",
+      "native model player uses the genuine native player entrypoint")
+    check(nativeModel["env"].hasKey("PLAYER_PROMPT") and
+      nativeModel["env"]["PLAYER_PROMPT"].getStr().len > 0,
+      "native model player sets PLAYER_PROMPT")
+    check(not nativeModel["env"].hasKey("PLAYER_SCRIPTED"),
+      "native model player explicitly omits PLAYER_SCRIPTED")
+    checkEqual(nativeModel["image"].getStr(), game["runnable"]["image"].getStr(),
+      "one image, two entrypoints")
+
+    let bundled = manifest["player"][1]
+    checkEqual(bundled["id"].getStr(), "baseline", "the scripted baseline id")
     checkEqual(bundled["type"].getStr(), "player", "its role type")
     check(bundled["name"].getStr().len > 0, "it has a name")
     check(bundled["description"].getStr().len > 0, "it has a description")
     checkEqual(bundled["run"][0].getStr(), "/bin/hive-player",
-      "the bundled player entrypoint")
+      "the scripted baseline entrypoint")
     checkEqual(bundled["env"]["PLAYER_SCRIPTED"].getStr(), "marcher",
-      "the certification player is the marcher, no LLM")
+      "the certification baseline is the marcher, no LLM")
     checkEqual(bundled["image"].getStr(), game["runnable"]["image"].getStr(),
       "one image, two entrypoints")
-    ## The certifier's players-run step needs every declared player seated by
-    ## at least one certification slot.
+    ## Every certification slot must reference a declared player and remain
+    ## purely scripted offline (`baseline`).
+    var declaredIds: seq[string]
     for entry in manifest["player"]:
-      var seated = false
-      for slot in manifest["certification"]["players"]:
-        if slot["player_id"].getStr() == entry["id"].getStr():
-          seated = true
-      check(seated, "bundled player " & entry["id"].getStr() &
-        " is seated by a certification slot")
+      declaredIds.add(entry["id"].getStr())
+    for slot in manifest["certification"]["players"]:
+      let pid = slot["player_id"].getStr()
+      check(pid in declaredIds,
+        "certification player_id " & pid & " is declared in manifest.player")
+      checkEqual(pid, "baseline",
+        "offline certification remains purely scripted")
     report("the image placeholder matches the compose service name")
 
   block topLevelShape:

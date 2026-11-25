@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import unittest
+import urllib.error
 
-from player import choose
+from player import RefusalError, choose, classify_player_error
 from policy import ScriptedPolicy, parse_json_object
 
 VIEW = {
@@ -99,6 +100,25 @@ class PlayerPolicyTest(unittest.TestCase):
         )
         self.assertEqual(source, "trained")
         self.assertEqual(action, VALID_DOCTRINE)
+
+    def test_classify_player_error_distinguishes_infra_from_parse(self) -> None:
+        self.assertEqual(classify_player_error(KeyError("ANTHROPIC_API_KEY"))[0], "no_credentials")
+        self.assertEqual(
+            classify_player_error(urllib.error.HTTPError("http://x", 401, "unauth", {}, None))[0],
+            "no_credentials",
+        )
+        self.assertEqual(
+            classify_player_error(urllib.error.HTTPError("http://x", 429, "limit", {}, None))[0],
+            "throttled",
+        )
+        self.assertEqual(
+            classify_player_error(urllib.error.HTTPError("http://x", 503, "down", {}, None))[0],
+            "provider_error",
+        )
+        self.assertEqual(classify_player_error(urllib.error.URLError("refused"))[0], "transport_error")
+        self.assertEqual(classify_player_error(TimeoutError("timed out"))[0], "timeout")
+        self.assertEqual(classify_player_error(RefusalError("refusal"))[0], "refusal")
+        self.assertEqual(classify_player_error(ValueError("bad json"))[0], "parse_error")
 
 
 if __name__ == "__main__":

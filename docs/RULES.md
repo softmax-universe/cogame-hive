@@ -181,12 +181,13 @@ colonies, so the only way to raise your score is to take food a rival did not.
 |---|---|---|
 | `complete` | `full_time` | All 4800 ticks simulated. The normal ending. |
 | `deadline` | `wall_clock` | The 660 s engine stop tripped first. Scores the counters as they stand; shares still sum to 1.0. |
-| `fault` | `sim_fault` | An invariant guard tripped. All scores 0.25, `winner: null`. |
-| `fault` | `host_error` | An unexpected server-side exception. Same treatment. |
+| `fault` | `sim_fault` | An invariant guard tripped. Episode ends unscored (`scores: [null, null, null, null]`, `winner: null`). |
+| `fault` | `host_error` | An unexpected server-side exception or unrecoverable player/model decision failure (missing connection, disconnect, timeout, invalid action, or provider/credential error). Same treatment: episode ends unscored with no winner or numeric scores. |
 
-A seat that never connects does **not** end the episode: its colony is driven
-by the `marcher` baseline for the whole match, the no-show is reported to
-`COGAME_PLAYER_FAILURE_URI`, and the match plays to full time.
+A seat that never connects, disconnects before deciding, or fails to produce a
+valid doctrine after its single retry is reported to `COGAME_PLAYER_FAILURE_URI`
+and terminates the episode unscored (`fault` / `host_error`). No scripted
+baseline or neutral hold doctrine is fabricated in place of an unknown decision.
 
 ## Determinism
 

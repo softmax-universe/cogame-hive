@@ -163,12 +163,12 @@ proc main() =
       "and it round-trips through the event encoder")
     report("truncation lands on rune boundaries and round-trips as UTF-8")
 
-  block neutralHoldFallback:
-    let fallback = holdFallbackDoctrine()
-    checkEqual($fallback.source, "fallback", "the fallback is labelled")
-    check(fallback.doctrine.recall, "the fallback is the neutral hold doctrine")
-    check(fallback.doctrine.isLegal(), "the fallback doctrine is legal")
-    report("failures land on the legal neutral hold doctrine, never marcher")
+  block noFabricatedHoldFallback:
+    let llmSrc = readRepoFile("src/hive/llm.nim")
+    let serverSrc = readRepoFile("src/hive/server.nim")
+    check("holdFallbackDoctrine" notin llmSrc and "holdFallbackDoctrine" notin serverSrc,
+      "no neutral hold fallback is fabricated in llm.nim or server.nim")
+    report("no neutral hold fallback doctrine exists in the decision pipeline")
 
 main()
 echo "test_doctrine: all checks passed"

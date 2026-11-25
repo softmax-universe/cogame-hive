@@ -1979,11 +1979,13 @@ body[data-embed] #board { top: 0; height: 100%; }
     var r = replay.results || {};
     var total = r.total_delivered || 0;
     var winner = r.winner;
-    $('ec-headline').textContent = winner === null || winner === undefined
-      ? 'Tied — ' + total + ' returned'
-      : replay.names.aliases[winner] + ' wins — ' + r.delivered[winner] +
-        ' of ' + total + ' (' +
-        (total ? (100 * r.delivered[winner] / total).toFixed(1) : '0.0') + '%)';
+    $('ec-headline').textContent = r.reason === 'fault'
+      ? 'Unscored — ' + (r.end_rule || 'fault')
+      : (winner === null || winner === undefined
+        ? 'Tied — ' + total + ' returned'
+        : replay.names.aliases[winner] + ' wins — ' + r.delivered[winner] +
+          ' of ' + total + ' (' +
+          (total ? (100 * r.delivered[winner] / total).toFixed(1) : '0.0') + '%)');
     $('ec-wincond').textContent = 'Most food carried home. Score is your share of all food returned.';
     $('ec-how').textContent = r.reason + ' / ' + r.end_rule + ' · ' +
       r.final_tick + ' ticks · seed ' + r.seed;
@@ -2000,7 +2002,9 @@ body[data-embed] #board { top: 0; height: 100%; }
       var line = document.createElement('div');
       line.className = 'ec-pol';
       line.textContent = r.delivered[seat] + ' returned · ' +
-        (r.scores[seat] * 100).toFixed(1) + '% · raids ' + r.raided_units[seat];
+        (r.scores[seat] === null || r.scores[seat] === undefined
+          ? 'unscored'
+          : (r.scores[seat] * 100).toFixed(1) + '%') + ' · raids ' + r.raided_units[seat];
       el.appendChild(name);
       el.appendChild(line);
       host.appendChild(el);

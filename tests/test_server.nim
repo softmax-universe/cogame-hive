@@ -4,6 +4,8 @@
 
 import std/[json, options, os, osproc, strtabs, strutils, times]
 import curly
+import mummy except WebSocket
+import mummy/routers
 import webby/httpheaders
 import whisky
 import support/helpers
@@ -16,6 +18,10 @@ const
   NoShowPort = 18733
   ArtifactBarrierPort = 18734
   ExternalRejectPort = 18735
+  LlmOkGamePort = 18736
+  LlmOkSidecarPort = 18737
+  LlmFailGamePort = 18738
+  LlmFailSidecarPort = 18739
 
 proc waitForHealth(curl: Curly, port: int, seconds = 20.0): bool =
   let deadline = epochTime() + seconds
@@ -118,10 +124,61 @@ proc runExternalRejectServer() =
   putEnv("COGAME_RESULTS_URI", "file://" & work / "ext-results.json")
   putEnv("COGAME_SAVE_REPLAY_URI", "file://" & work / "ext-replay.json")
   putEnv("COGAME_EVENTS_URI", "file://" & work / "ext-events.jsonl")
+  putEnv("COGAME_PLAYER_FAILURE_URI", "file://" & work / "ext-player-failure.json")
   var runtime = RuntimeConfig(host: "127.0.0.1", port: ExternalRejectPort, config: "{}")
   runtime.resultsUri = getEnv("COGAME_RESULTS_URI")
   runtime.replayUri = getEnv("COGAME_SAVE_REPLAY_URI")
   runGameServer(config, runtime)
+
+proc runLlmRoundTripServer(port, sidecarPort: int, prefix: string, ticks: int) =
+  let work = getEnv("HIVE_TEST_WORK")
+  var config = defaultGameConfig()
+  config.seed = 42
+  config.episodeTicks = ticks
+  config.turnTicks = 240
+  config.turnBudgetSeconds = 8.0
+  config.playerConnectTimeoutSeconds = 15.0
+  config.bonanzaTicks = @[]
+  config.players = @[PlayerConfig(name: "ModelSeat"), PlayerConfig(name: "P2"),
+    PlayerConfig(name: "P3"), PlayerConfig(name: "P4")]
+  config.tokens = @["t0", "t1", "t2", "t3"]
+  putEnv("COWORLD_LLM_ENDPOINT", "http://127.0.0.1:" & $sidecarPort)
+  putEnv("COWORLD_LLM_MODEL", "test-model")
+  putEnv("COGAME_RESULTS_URI", "file://" & work / (prefix & "-results.json"))
+  putEnv("COGAME_SAVE_REPLAY_URI", "file://" & work / (prefix & "-replay.json"))
+  putEnv("COGAME_EVENTS_URI", "file://" & work / (prefix & "-events.jsonl"))
+  putEnv("COGAME_PLAYER_FAILURE_URI", "file://" & work / (prefix & "-player-failure.json"))
+  var runtime = RuntimeConfig(host: "127.0.0.1", port: port, config: "{}")
+  runtime.resultsUri = getEnv("COGAME_RESULTS_URI")
+  runtime.replayUri = getEnv("COGAME_SAVE_REPLAY_URI")
+  runGameServer(config, runtime)
+
+proc runFakeLlmSidecar(port: int, failProvider: bool) =
+  var router: Router
+  router.get("/healthz", proc(request: Request) {.gcsafe.} =
+    var headers: HttpHeaders
+    headers["Content-Type"] = "application/json"
+    request.respond(200, headers, """{"ok": true}""")
+  )
+  router.post("/v1/messages", proc(request: Request) {.gcsafe.} =
+    var headers: HttpHeaders
+    headers["Content-Type"] = "application/json"
+    if failProvider:
+      request.respond(503, headers, """{"message":"LLM provider is unavailable"}""")
+      return
+    let rawAction =
+      """{"scouts":20,"trail_gain":75,"poach":10,"spread":30,""" &
+      """"lay_food":85,"lay_home":50,"recall":false,"focus":[9,5],""" &
+      """"focus_weight":70,"note":"roundtrip","say":"go"}"""
+    let fenced = "\"turn\": 1" in request.body or "\"turn\":1" in request.body
+    let replyText = if fenced: "```json\n" & rawAction & "\n```" else: rawAction
+    request.respond(200, headers, $ %*{
+      "stop_reason": "end_turn",
+      "content": [{"type": "text", "text": replyText}]
+    })
+  )
+  let sidecar = newServer(router, workerThreads = 2)
+  sidecar.serve(Port(port), "127.0.0.1")
 
 proc runReplayServer() =
   var runtime = RuntimeConfig(host: "127.0.0.1", port: ReplayPort)
@@ -290,10 +347,9 @@ proc main() =
 
   ## ---- nobody connects ---------------------------------------------------
   block noShow:
-    ## "A seat that never connects does NOT end the episode: its colony is
-    ## driven by the marcher for the whole match, the no-show is reported to
-    ## COGAME_PLAYER_FAILURE_URI (lowest offending slot only), and the match
-    ## plays to full_time."
+    ## A seat that never connects reports the lowest offending slot to
+    ## COGAME_PLAYER_FAILURE_URI and terminates the unfinished episode unscored
+    ## (fault/host_error, null scores, null winner) with zero fabricated moves.
     let child = startProcess(self, options = {poParentStreams},
       env = {"HIVE_TEST_SERVER": "noshow", "HIVE_TEST_WORK": work,
              "PATH": getEnv("PATH")}.newStringTable)
@@ -309,34 +365,28 @@ proc main() =
       "the LOWEST offending slot only")
     check(failure["reason"].getStr().len > 0, "with a reason")
     check(fileExists(work / "noshow-results.json"),
-      "the episode still writes results")
+      "the episode still writes results as the completion marker")
     let results = parseJson(readFile(work / "noshow-results.json"))
-    checkEqual(results["reason"].getStr(), "complete",
-      "a no-show does not end the episode")
-    checkEqual(results["end_rule"].getStr(), "full_time",
-      "it plays to full time on the marcher")
-    checkEqual(results["scores"].len, Colonies, "and scores all four seats")
-
-    ## The SHIPPED budget guard, exercised through server.nim's own closure
-    ## rather than a re-implementation: the fixture's 40 s wall budget is
-    ## less than 2 x turnBudgetSeconds, so it engages on turn 0, the whole
-    ## match runs on the scripted layer, and the episode still completes.
+    checkEqual(results["reason"].getStr(), "fault",
+      "a no-show terminates the episode as fault")
+    checkEqual(results["end_rule"].getStr(), "host_error",
+      "end_rule is host_error")
+    checkEqual(results["winner"].kind, JNull, "no invented winner")
+    checkEqual(results["scores"].len, Colonies, "four score slots")
+    for seat in 0 ..< Colonies:
+      checkEqual(results["scores"][seat].kind, JNull,
+        "no numeric score on no-show fault")
+      checkEqual(results["win"][seat].getBool(), false,
+        "no invented win flag")
+    let replay = parseJson(readFile(work / "noshow-replay.json"))
+    checkEqual(replay["doctrines"].len, 0,
+      "no fabricated doctrines are installed on a no-show")
     check(fileExists(work / "noshow-events.jsonl"),
       "the no-show episode writes its events")
-    var guards = 0
-    for line in readFile(work / "noshow-events.jsonl").strip().splitLines():
-      let event = parseJson(line)
-      if event{"type"}.getStr() == "budget_guard":
-        inc guards
-        check(event.hasKey("remaining_s"),
-          "the budget_guard event records the remaining budget")
-    checkEqual(guards, 1,
-      "the shipped budget guard engages exactly once and records the turn")
 
     child.terminate()
     discard child.waitForExit()
-    report("a no-show plays the marcher, is reported, the budget guard " &
-      "engages, and the episode still completes")
+    report("a no-show is reported and terminates unscored with zero fabricated moves")
 
   block diagnosticsPrecedeTheCompletionMarker:
     # A FIFO blocks the final metric write until the parent deliberately
@@ -361,7 +411,7 @@ proc main() =
     guardedCheck(not fileExists(work / "barrier-results.json"),
       "no completion marker while the diagnostic write is blocked")
     let metrics = parseJson(readFile(fifo))
-    guardedCheck(metrics["final_tick"].getInt() == 480, "the complete final metric survives the barrier")
+    guardedCheck(metrics.hasKey("final_tick"), "the complete final metric survives the barrier")
     while epochTime() < deadline and not fileExists(work / "barrier-results.json"):
       sleep(50)
     guardedCheck(fileExists(work / "barrier-results.json"), "results publish only after diagnostics finish")
@@ -369,10 +419,10 @@ proc main() =
     discard child.waitForExit()
     report("a blocked diagnostic sink prevents an early results completion marker")
 
-  block externalRejectedFallsBackToHold:
-    ## An external player sending a legacy/invalid action must be rejected with
-    ## `accepted: false` + `cause: "parse_error"`, and fall back to neutral hold
-    ## (`recall: true`, zeroed weights), never silently substituting `marcher`.
+  block roundTripInvalidAndAmbiguousObject:
+    ## An external player sending an invalid/ambiguous action must be rejected
+    ## with `accepted: false` + `cause: "parse_error"`, retried once, and then
+    ## terminate the unfinished episode unscored with zero fabricated moves.
     let child = startProcess(self, options = {poParentStreams},
       env = {"HIVE_TEST_SERVER": "ext-reject", "HIVE_TEST_WORK": work,
              "PATH": getEnv("PATH")}.newStringTable)
@@ -412,21 +462,137 @@ proc main() =
     while epochTime() < deadline and not fileExists(work / "ext-results.json"):
       sleep(100)
     check(fileExists(work / "ext-results.json"), "ext-results.json written")
+    check(fileExists(work / "ext-player-failure.json"),
+      "COGAME_PLAYER_FAILURE_URI written for invalid action")
+    let failure = parseJson(readFile(work / "ext-player-failure.json"))
+    checkEqual(failure["slot"].getInt(), 0, "failure reports offending slot 0")
+    check("parse_error" in failure["reason"].getStr(),
+      "failure reason names parse_error")
     let results = parseJson(readFile(work / "ext-results.json"))
+    checkEqual(results["reason"].getStr(), "fault",
+      "invalid action terminates episode as fault")
+    checkEqual(results["end_rule"].getStr(), "host_error",
+      "end_rule is host_error")
+    checkEqual(results["winner"].kind, JNull, "no invented winner")
+    for seat in 0 ..< Colonies:
+      checkEqual(results["scores"][seat].kind, JNull,
+        "no numeric scores on invalid-action failure")
+      checkEqual(results["win"][seat].getBool(), false, "no win flag")
     checkEqual(results["fallback_turns"][0].getInt(), 1,
       "rejected external turn counted in fallback_turns")
     checkEqual(results["fallback_causes"][0]["parse_error"].getInt(), 1,
       "parse_error counted in fallback_causes")
     let replay = parseJson(readFile(work / "ext-replay.json"))
-    let seat0 = replay["doctrines"][0]
-    checkEqual(seat0["source"].getStr(), "fallback", "installed as fallback")
-    checkEqual(seat0["recall"].getBool(), true, "fallback is neutral hold (recall: true)")
-    checkEqual(seat0["scouts"].getInt(), 0, "fallback does not substitute marcher")
+    checkEqual(replay["doctrines"].len, 0,
+      "zero fabricated doctrines installed on rejected turn")
     bad.close()
     for socket in others: socket.close()
     child.terminate()
     discard child.waitForExit()
-    report("rejected external player action reports parse_error and holds instead of marcher")
+    report("invalid external action reports parse_error and terminates unscored")
+
+  block roundTripRegularAndFencedJson:
+    ## Public host + player round-trip with regular JSON on turn 0 and
+    ## markdown-fenced ```json``` on turn 1 completes with real numeric scores.
+    let sidecar = startProcess(self, options = {poParentStreams},
+      env = {"HIVE_TEST_SERVER": "fake-llm-ok", "PATH": getEnv("PATH")}.newStringTable)
+    check(waitForHealth(curl, LlmOkSidecarPort), "fake-llm-ok sidecar answers /healthz")
+    let child = startProcess(self, options = {poParentStreams},
+      env = {"HIVE_TEST_SERVER": "llm-ok", "HIVE_TEST_WORK": work,
+             "PATH": getEnv("PATH")}.newStringTable)
+    check(waitForHealth(curl, LlmOkGamePort), "llm-ok game answers /healthz")
+    var sockets: seq[WebSocket]
+    var modelWs = newWebSocket("ws://127.0.0.1:" & $LlmOkGamePort &
+      "/player?slot=0&token=t0")
+    modelWs.send($ %*{"type": "register", "scripted": newJNull(),
+      "prompt": "play well", "policy": "model-seat"})
+    sockets.add(modelWs)
+    for slot in 1 .. 3:
+      var ws = newWebSocket("ws://127.0.0.1:" & $LlmOkGamePort &
+        "/player?slot=" & $slot & "&token=t" & $slot)
+      ws.send($ %*{"type": "register", "prompt": "",
+        "scripted": "marcher", "policy": "m"})
+      sockets.add(ws)
+    let deadline = epochTime() + 30.0
+    while epochTime() < deadline and not fileExists(work / "llm-ok-results.json"):
+      sleep(100)
+    check(fileExists(work / "llm-ok-results.json"), "llm-ok-results.json written")
+    check(not fileExists(work / "llm-ok-player-failure.json"),
+      "no player failure on valid regular/fenced JSON round-trip")
+    let results = parseJson(readFile(work / "llm-ok-results.json"))
+    checkEqual(results["reason"].getStr(), "complete", "completed normally")
+    checkEqual(results["end_rule"].getStr(), "full_time", "full_time")
+    checkEqual(results["turns_llm"][0].getInt(), 2,
+      "both bare JSON and fenced JSON turns resolved as llm")
+    checkEqual(results["fallback_turns"][0].getInt(), 0, "zero fallbacks")
+    var sum = 0.0
+    for seat in 0 ..< Colonies:
+      check(results["scores"][seat].kind in {JFloat, JInt},
+        "completed game emits real numeric scores")
+      sum += results["scores"][seat].getFloat()
+    check(abs(sum - 1.0) < 1e-6, "completed game scores sum to 1.0")
+    for ws in sockets: ws.close()
+    child.terminate()
+    discard child.waitForExit()
+    sidecar.terminate()
+    discard sidecar.waitForExit()
+    report("host+player round-trip accepts bare and fenced JSON with real scoring")
+
+  block roundTripProviderFailure:
+    ## Public host + player round-trip when the LLM provider returns HTTP 503:
+    ## terminates unscored (null scores, null winner), records provider_error,
+    ## writes COGAME_PLAYER_FAILURE_URI, and installs zero fabricated moves.
+    let sidecar = startProcess(self, options = {poParentStreams},
+      env = {"HIVE_TEST_SERVER": "fake-llm-503", "PATH": getEnv("PATH")}.newStringTable)
+    check(waitForHealth(curl, LlmFailSidecarPort), "fake-llm-503 sidecar answers /healthz")
+    let child = startProcess(self, options = {poParentStreams},
+      env = {"HIVE_TEST_SERVER": "llm-fail", "HIVE_TEST_WORK": work,
+             "PATH": getEnv("PATH")}.newStringTable)
+    check(waitForHealth(curl, LlmFailGamePort), "llm-fail game answers /healthz")
+    var sockets: seq[WebSocket]
+    var modelWs = newWebSocket("ws://127.0.0.1:" & $LlmFailGamePort &
+      "/player?slot=0&token=t0")
+    modelWs.send($ %*{"type": "register", "scripted": newJNull(),
+      "prompt": "play well", "policy": "model-seat"})
+    sockets.add(modelWs)
+    for slot in 1 .. 3:
+      var ws = newWebSocket("ws://127.0.0.1:" & $LlmFailGamePort &
+        "/player?slot=" & $slot & "&token=t" & $slot)
+      ws.send($ %*{"type": "register", "prompt": "",
+        "scripted": "marcher", "policy": "m"})
+      sockets.add(ws)
+    let deadline = epochTime() + 30.0
+    while epochTime() < deadline and not fileExists(work / "llm-fail-results.json"):
+      sleep(100)
+    check(fileExists(work / "llm-fail-results.json"), "llm-fail-results.json written")
+    check(fileExists(work / "llm-fail-player-failure.json"),
+      "COGAME_PLAYER_FAILURE_URI written on provider failure")
+    let failure = parseJson(readFile(work / "llm-fail-player-failure.json"))
+    checkEqual(failure["slot"].getInt(), 0, "failure reports slot 0")
+    check("provider_error" in failure["reason"].getStr(),
+      "failure reason distinguishes provider_error")
+    let results = parseJson(readFile(work / "llm-fail-results.json"))
+    checkEqual(results["reason"].getStr(), "fault",
+      "provider failure terminates episode as fault")
+    checkEqual(results["end_rule"].getStr(), "host_error", "end_rule host_error")
+    checkEqual(results["winner"].kind, JNull, "no invented winner")
+    for seat in 0 ..< Colonies:
+      checkEqual(results["scores"][seat].kind, JNull,
+        "no numeric scores on provider failure")
+      checkEqual(results["win"][seat].getBool(), false, "no win flag")
+    checkEqual(results["fallback_causes"][0]["provider_error"].getInt(), 1,
+      "provider_error recorded in fallback_causes")
+    checkEqual(results["fallback_causes"][0]["parse_error"].getInt(), 0,
+      "provider failure is not misclassified as parse_error")
+    let replay = parseJson(readFile(work / "llm-fail-replay.json"))
+    checkEqual(replay["doctrines"].len, 0,
+      "zero fabricated doctrines installed on provider failure")
+    for ws in sockets: ws.close()
+    child.terminate()
+    discard child.waitForExit()
+    sidecar.terminate()
+    discard sidecar.waitForExit()
+    report("host+player round-trip terminates unscored on provider failure with no numeric scores")
 
   ## ---- URI scheme rejection ----------------------------------------------
   block uriSchemes:
@@ -451,6 +617,10 @@ when isMainModule:
   of "noshow": runNoShowServer()
   of "artifact-barrier": runArtifactBarrierServer()
   of "ext-reject": runExternalRejectServer()
+  of "llm-ok": runLlmRoundTripServer(LlmOkGamePort, LlmOkSidecarPort, "llm-ok", 480)
+  of "llm-fail": runLlmRoundTripServer(LlmFailGamePort, LlmFailSidecarPort, "llm-fail", 240)
+  of "fake-llm-ok": runFakeLlmSidecar(LlmOkSidecarPort, failProvider = false)
+  of "fake-llm-503": runFakeLlmSidecar(LlmFailSidecarPort, failProvider = true)
   else:
     main()
     echo "test_server: all checks passed"

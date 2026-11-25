@@ -444,6 +444,28 @@ proc applied*(capture: RuntimeCapture, decision: CapturedDecision,
   except CatchableError as error:
     capture.captureError("applied evidence failed: " & error.msg)
 
+proc aborted*(capture: RuntimeCapture, decision: CapturedDecision,
+    seat: int, cause, detail: string) =
+  ## Records an unapplied turn when a decision failure aborts the episode unscored.
+  if capture == nil or decision == nil: return
+  try:
+    capture.failed = true
+    let status =
+      if cause == "parse_error" or decision.attempts.len > 0: asRejected
+      else: asMissing
+    decision.observation["native_abort"] = %*{"cause": cause, "detail": detail}
+    if capture.trajectory != nil:
+      var estimate = 4096 + 2 * ($decision.observation).len
+      for evidence in decision.attempts: estimate += 2 * ($attemptEvidenceJson(evidence)).len
+      if capture.evidenceBytes + estimate > MaxEpisodeEvidenceBytes - 4096:
+        capture.captureError("episode evidence exceeds 24 MiB; decision omitted, no truncation")
+        return
+      capture.evidenceBytes += estimate
+      capture.trajectory.recordDecision(decision.id, $seat, decision.observation,
+        decision.attempts, none(string), newJNull(), status, terminal = true)
+  except CatchableError as error:
+    capture.captureError("aborted evidence failed: " & error.msg)
+
 proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
   if capture == nil: return
   try:

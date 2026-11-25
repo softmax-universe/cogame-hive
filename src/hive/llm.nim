@@ -8,17 +8,18 @@
 ## failed seats are retried once as a smaller batch - with a "your reply was
 ## invalid" hint only when the model actually replied with something
 ## unusable, and after a short backoff when the provider throttled or errored
-## - and anything still failing falls back to the neutral hold doctrine
-## and writes a `fallback` event. Seats are NEVER queried sequentially.
+## - and anything still failing returns a non-empty `cause` so the server can
+## record the failure and terminate the episode unscored. Seats are NEVER
+## queried sequentially.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials the client disables itself on first discovery, every
-## turn falls back instantly with no network wait, and offline certification
-## still completes. That fallback is load-bearing.
+## With no credentials the client disables itself on first discovery; any
+## hosted LLM seat then reports `no_credentials` rather than substituting a
+## fabricated doctrine. Scripted seats do not use the LLM client.
 
 import std/[json, os, strutils, times, unicode]
 import bitworld/runtime
@@ -158,7 +159,7 @@ proc newLlmClient*(model = "claude-sonnet-5", maxOutputTokens = 900,
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "hive llm: no LLM credentials; non-scripted seats will hold"
+    echo "hive llm: no LLM credentials; hosted model seats will fail with no_credentials"
 
 proc userMessage*(match: Sim, seat: int, prompt: string): string =
   ## The seat's PLAYER_PROMPT text, a blank line, then the seat's view JSON.
@@ -290,14 +291,6 @@ proc needsBackoff(open: seq[int],
       return true
   false
 
-proc holdFallbackDoctrine*(): ResolvedDoctrine =
-  ## Neutral recall/hold doctrine for scored LLM failures (never `skMarcher`).
-  ResolvedDoctrine(
-    doctrine: Doctrine(recall: true),
-    source: dsFallback,
-    latencyMs: 0
-  )
-
 proc decideAll*(
   client: LlmClient,
   match: Sim,
@@ -309,8 +302,9 @@ proc decideAll*(
   external: array[Colonies, bool] = [false, false, false, false],
   models: array[Colonies, string] = ["", "", "", ""]
 ): array[Colonies, SeatOutcome] =
-  ## One doctrine per seat. NEVER raises and never blocks unboundedly: at
-  ## most two bounded batches, then the scripted layer.
+  ## One outcome per seat. NEVER raises and never blocks unboundedly: at most
+  ## two bounded batches. A seat that fails leaves `cause` non-empty and never
+  ## substitutes a fabricated or scripted doctrine.
   var views: array[Colonies, JsonNode]
   var previous: array[Colonies, Doctrine]
   var hasPrevious: array[Colonies, bool]
@@ -333,14 +327,13 @@ proc decideAll*(
       )
     elif client.disabled or prompts[seat].len == 0:
       result[seat] = SeatOutcome(
-        resolved: holdFallbackDoctrine(),
         cause: "no_credentials",
-        detail: "",
+        detail: (if prompts[seat].len == 0: "seat has no registered prompt or scripted policy"
+                 else: "no LLM credentials configured"),
         attempts: 0
       )
     elif models[seat].len > 0 and client.transport == ltBedrock:
       result[seat] = SeatOutcome(
-        resolved: holdFallbackDoctrine(),
         cause: "provider_error", detail: "Per-seat model selection requires the sidecar or Anthropic transport",
         attempts: 0)
     else:
@@ -444,8 +437,8 @@ proc decideAll*(
     open = stillOpen
 
   for seat in open:
-    ## Two consecutive failures, or the outer per-turn deadline: the neutral
-    ## hold doctrine, plus the `fallback` event the caller writes.
+    ## Two consecutive failures, or the outer per-turn deadline: leave `cause`
+    ## populated so the server terminates the unfinished episode unscored.
     if outerExpired:
       echo "hive llm: seat ", seat, " out of per-turn budget (",
         client.turnBudgetSeconds, "s)"
@@ -455,5 +448,5 @@ proc decideAll*(
           "per-turn deadline of " & $client.turnBudgetSeconds &
           "s expired before this seat could be asked", MaxDetailRunes)
         result[seat].attempts = max(1, result[seat].attempts)
-    echo "hive llm: seat ", seat, " falling back to neutral hold doctrine"
-    result[seat].resolved = holdFallbackDoctrine()
+    echo "hive llm: seat ", seat, " failed (", result[seat].cause,
+      "); no substitute doctrine will be played"
