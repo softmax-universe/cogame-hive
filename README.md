@@ -94,8 +94,11 @@ tools/                    the CI smoke, the viewer build hook, wire constants
 ## Build and run
 
 CI is the harness — `.github/workflows/ci.yml` runs every `tests/*.nim` twice
-(debug and `-d:release`), builds the image and plays one real episode in raw
-Docker from the certification fixture, and builds the static replay bundle.
+(debug and `-d:release`), builds the image and plays one offline scripted
+episode in raw Docker (`tools/ci/docker_smoke.sh`), and builds the static replay
+bundle. The release certification fixture in `coworld_manifest_template.json`
+seats the native `llm` model player at seat 0 alongside bundled `baseline`
+seats so every declared player ID is certified with real model decisions.
 
 Locally:
 

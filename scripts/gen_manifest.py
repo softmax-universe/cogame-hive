@@ -386,7 +386,10 @@ def main() -> None:
                 "type": "game",
                 "image": image,
                 "run": ["/bin/hive"],
-                "env": {},
+                "env": {
+                    "COWORLD_LLM_ENABLED": "true",
+                    "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+                },
                 "source_url": source_url,
             },
             "replay_viewer": {"bundle": "static-replay-viewer"},
@@ -415,9 +418,10 @@ def main() -> None:
             },
         },
         # Bundled player runnables live at the TOP level: the native model
-        # player is listed first (with PLAYER_PROMPT and no PLAYER_SCRIPTED),
-        # and the scripted marcher baseline is kept as a separate explicit ID
-        # used by offline certification.
+        # player is listed first (with COWORLD_LLM_ENABLED=true,
+        # COWORLD_LLM_MODEL, PLAYER_PROMPT, and no PLAYER_SCRIPTED), and the
+        # scripted marcher baseline is kept as a separate explicit ID. Both
+        # declared player IDs are seated in the release certification fixture.
         "player": [
             {
                 "id": "llm",
@@ -433,6 +437,8 @@ def main() -> None:
                 "image": image,
                 "run": ["/bin/hive-player"],
                 "env": {
+                    "COWORLD_LLM_ENABLED": "true",
+                    "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
                     "PLAYER_PROMPT": (
                         "Build one road at a time and keep it alive. Open wide "
                         "on turns 0-2 with high scouts and low trail_gain, then "
@@ -477,7 +483,10 @@ def main() -> None:
                     4800, 660, [1200, 3600], field_path="crossroads"),
         ],
         "certification": {
-            "players": [{"player_id": "baseline"} for _ in range(SEATS)],
+            "players": [
+                {"player_id": "llm"},
+                *({"player_id": "baseline"} for _ in range(SEATS - 1)),
+            ],
             "game_config": {
                 "players": players(SEATS),
                 "num_agents": SEATS,

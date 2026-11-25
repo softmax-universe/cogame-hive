@@ -1,8 +1,9 @@
 # Hive training
 
 Build `Dockerfile.ordinary-player` and seat the image through the normal
-Coworld player interface. The certification fixture keeps its bundled
-marcher players. An ordinary player uses the same authenticated JSON WebSocket.
+Coworld player interface. The certification fixture seats the native model
+player at seat 0 alongside bundled marcher baselines. An ordinary player uses
+the same authenticated JSON WebSocket.
 Each turn it receives a private view and constructs its own prompt and complete
 doctrine candidates. The game parses and records its returned doctrine.
 
