@@ -34,7 +34,8 @@ import bitworld/runtime
 import curly
 import mummy, mummy/routers
 import types, config, field, doctrine, baselines, roster, sim, rules,
-  broadcast, global, llm, replay, state, events, prompts, training_capture
+  broadcast, global, llm, replay, state, events, prompts, training_capture,
+  text_safety
 
 const
   ShutdownGraceSeconds* = 20.0
@@ -162,16 +163,66 @@ proc requireFileUri*(name: string): string =
       name & " must be a file:// URI, got: " & value)
   value
 
-proc declarePlayerFailure(slot: int, reason: string) =
-  ## The lowest offending slot only, paintbot's `declarePlayerFailure`.
+type
+  PlayerFailureKind* = enum
+    pfkPlayerError = "player_error"
+    pfkEpisodeInconclusive = "episode_inconclusive"
+
+proc playerFailureKindFor*(
+  cause: string,
+  external: bool,
+  detail = ""
+): PlayerFailureKind =
+  ## Maps a Hive turn failure cause to Coworld's closed GamePlayerFailure.kind.
+  case cause
+  of "transport_error", "throttled", "provider_error", "budget_guard":
+    pfkEpisodeInconclusive
+  of "no_credentials":
+    if detail == "seat has no registered prompt or scripted policy":
+      pfkPlayerError
+    else:
+      pfkEpisodeInconclusive
+  of "timeout":
+    if external: pfkPlayerError
+    else: pfkEpisodeInconclusive
+  else:
+    pfkPlayerError
+
+proc playerFailurePayload*(
+  slot: int,
+  message: string,
+  kind: PlayerFailureKind
+): JsonNode =
+  ## Closed Coworld GamePlayerFailure wire schema (extra="forbid"):
+  ##   failed_policy_index: int >= 0
+  ##   message: str (1..2000 runes, valid UTF-8)
+  ##   kind: "player_error" | "episode_inconclusive"
+  let safeText =
+    if scalarUtf8(message): message
+    else: "player failure (non-UTF-8 diagnostic omitted)"
+  var normalized = truncateRunes(safeText, MaxPlayerFailureMessageRunes)
+  if normalized.len == 0:
+    normalized =
+      if kind == pfkEpisodeInconclusive: "episode inconclusive"
+      else: "player failure"
+  %*{
+    "failed_policy_index": max(0, slot),
+    "message": normalized,
+    "kind": $kind
+  }
+
+proc declarePlayerFailure(slot: int, reason: string, kind: PlayerFailureKind) =
+  ## Publishes ONLY Coworld's closed GamePlayerFailure to
+  ## COGAME_PLAYER_FAILURE_URI for the lowest offending slot.
   let uri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
   if uri.len == 0:
     return
-  let payload = $ %*{"slot": slot, "reason": reason}
+  let payload = $playerFailurePayload(slot, reason, kind)
   try:
     writeArtifact(uri, payload, "application/json",
       "COGAME_PLAYER_FAILURE_METHOD")
-    echo "hive: reported player failure for slot ", slot, ": ", reason
+    echo "hive: reported player failure (", $kind, ") for slot ", slot, ": ",
+      reason
   except CatchableError as error:
     echo "hive: could not report player failure: ", error.msg
 
@@ -230,7 +281,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       ## A seat that never connects terminates the episode unscored instead of
       ## fabricating a substitute or scripted move.
       let detail = "player never connected"
-      declarePlayerFailure(missing[0], detail)
+      declarePlayerFailure(missing[0], "timeout: " & detail, pfkPlayerError)
       for seat in missing:
         fallbackTurns[seat].inc
         fallbackCauses[seat][causeIndex("timeout")].inc
@@ -462,7 +513,9 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           (if outcomes[firstFailed].detail.len > 0:
             ": " & truncateRunes(outcomes[firstFailed].detail, MaxDetailRunes)
            else: "")
-        declarePlayerFailure(firstFailed, reasonText)
+        let failureKind = playerFailureKindFor(outcomes[firstFailed].cause,
+          external[firstFailed], outcomes[firstFailed].detail)
+        declarePlayerFailure(firstFailed, reasonText, failureKind)
         raise newException(HiveError,
           "decision failed for seat " & $firstFailed & ": " & reasonText)
 
@@ -560,6 +613,13 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           "turns_llm": @turnsLlm,
           "fallback_turns": @fallbackTurns
         }, "application/json", "COGAME_METRICS_METHOD")
+      # On an unscored fault (player failure, unavailable gateway, or native
+      # transport/host error), retain private diagnostics and replay, do NOT
+      # write results.json, and exit nonzero.
+      if game.match.reason == erFault:
+        echo "hive: episode terminated unscored (", $game.match.reason, "/",
+          $game.match.rule, "); omitting results.json and exiting nonzero"
+        quit(1)
       # Results is the worker's completion marker. Every diagnostic and the
       # private capture must be durable before it can trigger pod teardown.
       writeArtifact(runtimeConfig.resultsUri, $results, "application/json",

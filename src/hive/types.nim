@@ -51,6 +51,7 @@ const
   MaxSayRunes* = 32
   MaxPolicyRunes* = 48
   MaxDetailRunes* = 200
+  MaxPlayerFailureMessageRunes* = 2000
   MaxPromptRunes* = 4000
 
   ## Ant state codes as written into the replay's `ants_b64`.

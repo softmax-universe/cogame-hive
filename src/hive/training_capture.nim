@@ -477,7 +477,7 @@ proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
       capture.captureError("non-Unicode native outcome; original JSON bytes retained as base64")
       privateOutcome = %*{"invalid_native_outcome_json_b64": encode($outcome)}
     if not scalarJson(scores): scores = newJNull()
-    let status = if capture.failed: esFailed
+    let status = if capture.failed or outcome{"reason"}.getStr() == "fault": esFailed
       elif outcome{"reason"}.getStr() == "complete": esCompleted else: esTruncated
     if capture.failed:
       privateOutcome["capture_errors"] = %capture.errors

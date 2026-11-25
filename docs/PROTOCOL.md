@@ -54,10 +54,11 @@ The game strictly validates the action using its doctrine parser, then records
 it in the replay. It sends `decision_result` with an `accepted` boolean (plus
 `cause` and `detail` when rejected) before the informational `turn` frame.
 Missing or invalid decisions are retried once; if still missing or invalid, the
-server records the failure cause, reports the offending slot to
-`COGAME_PLAYER_FAILURE_URI`, and terminates the unfinished episode unscored
-(`fault` / `host_error`, `scores: [null, null, null, null]`, `winner: null`)
-with no fabricated substitute doctrine. All requests are sent before the game
+server records private failure diagnostics, publishes only Coworld's closed
+`GamePlayerFailure` payload (`{"failed_policy_index": <slot>, "message":
+"<1..2000 runes>", "kind": "player_error" | "episode_inconclusive"}`) to
+`COGAME_PLAYER_FAILURE_URI`, omits `results.json`, and exits nonzero with no
+fabricated substitute doctrine. All requests are sent before the game
 waits for any seat. The game never receives an inference credential.
 
 ### game → player

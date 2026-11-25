@@ -39,7 +39,15 @@ def main():
     parser.add_argument("--expect-missing", action="store_true")
     parser.add_argument(
         "--mode",
-        choices=["normal", "mixed", "unicode-red", "boundary"],
+        choices=[
+            "normal",
+            "mixed",
+            "unicode-red",
+            "boundary",
+            "invalid",
+            "provider-503",
+            "unavailable",
+        ],
         default="normal",
     )
     parser.add_argument(
@@ -71,7 +79,11 @@ def main():
         k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LANG") if k in os.environ
     }
     ticks = (
-        240 if args.mode == "unicode-red" else 480 if args.mode == "boundary" else 4800
+        240
+        if args.mode in ("unicode-red", "invalid", "provider-503", "unavailable")
+        else 480
+        if args.mode == "boundary"
+        else 4800
     )
     config: dict[str, Any] = {
         "seed": 1988503998,
@@ -162,6 +174,13 @@ def main():
                 case = "normal"
                 if args.mode == "boundary" and turn == 0:
                     text = "not JSON"  # Exhaust both native attempts on hosted seats.
+                elif args.mode == "invalid" and slot == 0:
+                    text = "not JSON"
+                    case = "invalid-json"
+                elif args.mode == "provider-503" and slot == 0:
+                    status = 503
+                    text = '{"error":"service unavailable"}'
+                    case = "provider-503"
                 elif args.mode == "unicode-red":
                     action["note"] = "\udc00"
                     text = json.dumps(action)
@@ -324,8 +343,15 @@ def main():
             "COGAME_CONFIG_URI": (output / "config.json").as_uri(),
             "COGAME_RESULTS_URI": (output / "results.json").as_uri(),
             "COGAME_SAVE_REPLAY_URI": (output / "replay.json").as_uri(),
-            "COWORLD_LLM_ENDPOINT": f"http://127.0.0.1:{server.server_port}",
-            "COWORLD_LLM_MODEL": "local-hive-sentinel",
+            "COGAME_PLAYER_FAILURE_URI": (output / "player_failure.json").as_uri(),
+            **(
+                {}
+                if args.mode == "unavailable"
+                else {
+                    "COWORLD_LLM_ENDPOINT": f"http://127.0.0.1:{server.server_port}",
+                    "COWORLD_LLM_MODEL": "local-hive-sentinel",
+                }
+            ),
             "COWORLD_GAME_NAME": "hive",
             "COWORLD_EPISODE_ID": "local-hive-native",
             "COWORLD_GAME_VERSION": "0.0.0",
@@ -559,22 +585,38 @@ def main():
                 external_thread = threading.Thread(target=external, daemon=True)
                 external_thread.start()
             for slot in range(1 if args.mode == "boundary" else 0, 4):
-                launch(
-                    [str(args.player.resolve())],
-                    base
-                    | {
-                        "COWORLD_PLAYER_WS_URL": f"ws://127.0.0.1:{port}/player?slot={slot}&token={config['tokens'][slot]}",
+                ordinary_failure_mode = args.mode in (
+                    "invalid",
+                    "provider-503",
+                    "unavailable",
+                )
+                seat_env = (
+                    {"PLAYER_SCRIPTED": "marcher"}
+                    if ordinary_failure_mode and slot > 0
+                    else {
                         "PLAYER_PROMPT": args.operator_prompt,
                         **(
                             {"PLAYER_MODEL": args.player_model}
                             if args.player_model and slot == 0
                             else {}
                         ),
-                    },
+                    }
+                )
+                launch(
+                    [str(args.player.resolve())],
+                    base
+                    | {
+                        "COWORLD_PLAYER_WS_URL": f"ws://127.0.0.1:{port}/player?slot={slot}&token={config['tokens'][slot]}",
+                    }
+                    | seat_env,
                     f"player-{slot}",
                 )
         game.wait(timeout=max(1, 180 - (time.monotonic() - begin)))
-        assert game.returncode == 0
+        expected_failure_mode = args.mode in ("invalid", "provider-503", "unavailable")
+        if expected_failure_mode:
+            assert game.returncode != 0, f"expected nonzero exit, got {game.returncode}"
+        else:
+            assert game.returncode == 0, f"expected exit 0, got {game.returncode}"
         for child in children[1:]:
             child.wait(timeout=5)
             assert child.returncode == 0
@@ -693,7 +735,58 @@ def main():
                 "private_sink_failure": args.sink_failure,
                 "genuine_teachers": 0,
             }
+        elif expected_failure_mode:
+            assert not (output / "results.json").exists(), (
+                "results.json must NOT be written on unscored failure"
+            )
+            failure_path = output / "player_failure.json"
+            assert failure_path.exists(), "player_failure.json must be written"
+            failure = json.loads(failure_path.read_text())
+            assert set(failure.keys()) == {
+                "failed_policy_index",
+                "message",
+                "kind",
+            }, f"closed GamePlayerFailure schema violated: {failure!r}"
+            assert type(failure["failed_policy_index"]) is int
+            assert failure["failed_policy_index"] == 0
+            assert isinstance(failure["message"], str)
+            assert 1 <= len(failure["message"]) <= 2000
+            expected_kind = (
+                "player_error" if args.mode == "invalid" else "episode_inconclusive"
+            )
+            assert failure["kind"] == expected_kind, (
+                f"expected kind={expected_kind}, got {failure['kind']!r}"
+            )
+            if args.mode == "invalid":
+                assert "parse_error" in failure["message"]
+            elif args.mode == "provider-503":
+                assert "provider_error" in failure["message"]
+            elif args.mode == "unavailable":
+                assert "no_credentials" in failure["message"]
+            replay = json.loads(raw)
+            assert replay["doctrines"] == []
+            assert replay["results"]["reason"] == "fault"
+            if args.capture:
+                rows = [
+                    json.loads(x)
+                    for x in (output / "trajectory.jsonl").read_text().splitlines()
+                ]
+                assert rows[-1]["status"] == "failed"
+            result = {
+                "status": "PASS",
+                "mode": args.mode,
+                "exit_code": game.returncode,
+                "results_omitted": True,
+                "player_failure": failure,
+                "http_calls": len(calls),
+                "genuine_teachers": 0,
+            }
         else:
+            assert (output / "results.json").exists()
+            assert not (output / "player_failure.json").exists()
+            results = json.loads((output / "results.json").read_text())
+            assert results["reason"] == "complete"
+            assert abs(sum(results["scores"]) - 1.0) < 1e-6
             replay = json.loads(raw)
             assert (
                 replay["tick_count"] == 4800
