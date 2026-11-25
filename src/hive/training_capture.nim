@@ -440,7 +440,7 @@ proc applied*(capture: RuntimeCapture, decision: CapturedDecision,
       capture.evidenceBytes += estimate
       capture.trajectory.recordDecision(decision.id, $seat, decision.observation,
         decision.attempts, selected, actual, status,
-        fallbackOrigin = (if fallback: some("marcher") else: none(string)))
+        fallbackOrigin = (if fallback: some("hold") else: none(string)))
   except CatchableError as error:
     capture.captureError("applied evidence failed: " & error.msg)
 

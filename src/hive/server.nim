@@ -292,16 +292,20 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var outcomes: array[Colonies, SeatOutcome]
       if guardEngaged:
         for seat in 0 ..< Colonies:
-          let view = buildView(match, seat)
-          outcomes[seat] = SeatOutcome(
-            resolved: scriptedResolved(view, skMarcher, turn, memory[seat],
-              dsFallback),
-            cause: "budget_guard"
-          )
+          if scripted[seat] != skNone:
+            let view = buildView(match, seat)
+            outcomes[seat] = SeatOutcome(
+              resolved: scriptedResolved(view, scripted[seat], turn, memory[seat]),
+              cause: ""
+            )
+          else:
+            outcomes[seat] = SeatOutcome(
+              resolved: holdFallbackDoctrine(),
+              cause: "budget_guard"
+            )
       else:
         var sockets: array[Colonies, WebSocket]
         var requests: array[Colonies, JsonNode]
-        var marcher: array[Colonies, ResolvedDoctrine]
         var waiting: seq[int]
         let externalStarted = epochTime()
         let turnDeadline = externalStarted + gameConfig.turnBudgetSeconds
@@ -315,12 +319,10 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           if not external[seat]:
             continue
           let view = buildView(match, seat)
-          marcher[seat] = scriptedResolved(view, skMarcher, turn,
-            memory[seat])
           if not connected[seat]:
-            outcomes[seat] = SeatOutcome(resolved: marcher[seat],
+            outcomes[seat] = SeatOutcome(
+              resolved: holdFallbackDoctrine(),
               cause: "timeout", detail: "player disconnected")
-            outcomes[seat].resolved.source = dsFallback
             continue
           requests[seat] = %*{
             "type": "decision_request", "turn": turn,
@@ -375,12 +377,16 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               continue
             try:
               let payload = parseJson(raw)
-              if payload{"type"}.getStr() != "decision" or
+              if payload.kind != JObject or
+                  payload{"type"}.getStr() != "decision" or
                   payload{"turn"}.getInt(-1) != turn:
                 raise newException(HiveError,
                   "external decision differs from the pending turn")
+              if not payload.hasKey("action") or payload["action"].kind != JObject:
+                raise newException(HiveError,
+                  "external decision action must be a JSON object")
               let colony = match.seatNest[seat]
-              let parsed = parseDoctrine($payload["action"],
+              let parsed = parseDoctrineNode(payload["action"],
                 match.doctrines[colony], match.hasDoctrine[colony])
               let source = payload{"source"}.getStr()
               if source notin ["scripted", "external", "llm", "trained"]:
@@ -398,18 +404,21 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               retry.add(seat)
           waiting = retry
         for seat in waiting:
-          outcomes[seat].resolved = marcher[seat]
-          outcomes[seat].resolved.source = dsFallback
+          outcomes[seat].resolved = holdFallbackDoctrine()
         withLock stateLock:
           game.pendingExternalTurn = -1
 
         for seat in 0 ..< Colonies:
           if connected[seat]:
             try:
-              sockets[seat].send($(%*{
+              var ack = %*{
                 "type": "decision_result", "turn": turn,
                 "accepted": outcomes[seat].cause.len == 0
-              }))
+              }
+              if outcomes[seat].cause.len > 0:
+                ack["cause"] = %outcomes[seat].cause
+                ack["detail"] = %truncateRunes(outcomes[seat].detail, MaxDetailRunes)
+              sockets[seat].send($ack)
             except CatchableError:
               discard
 
@@ -670,9 +679,9 @@ proc websocketHandler(
           let scriptedNode = payload{"scripted"}
           let scripted =
             if scriptedNode.isNil or scriptedNode.kind == JNull: ""
-            elif scriptedNode.kind == JBool:
-              (if scriptedNode.getBool(): "marcher" else: "")
-            else: scriptedNode.getStr()
+            elif scriptedNode.kind == JString: scriptedNode.getStr()
+            else:
+              raise newException(HiveError, "register.scripted must be a string or null")
           withLock stateLock:
             if game.playerSockets.getOrDefault(slot) != websocket:
               return

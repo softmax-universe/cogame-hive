@@ -8,7 +8,7 @@
 ## failed seats are retried once as a smaller batch - with a "your reply was
 ## invalid" hint only when the model actually replied with something
 ## unusable, and after a short backoff when the provider throttled or errored
-## - and anything still failing falls back to the `marcher` scripted doctrine
+## - and anything still failing falls back to the neutral hold doctrine
 ## and writes a `fallback` event. Seats are NEVER queried sequentially.
 ##
 ## Credentials, in order of preference:
@@ -158,7 +158,7 @@ proc newLlmClient*(model = "claude-sonnet-5", maxOutputTokens = 900,
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "hive llm: no LLM credentials; using scripted fallback"
+    echo "hive llm: no LLM credentials; non-scripted seats will hold"
 
 proc userMessage*(match: Sim, seat: int, prompt: string): string =
   ## The seat's PLAYER_PROMPT text, a blank line, then the seat's view JSON.
@@ -444,9 +444,8 @@ proc decideAll*(
     open = stillOpen
 
   for seat in open:
-    ## Two consecutive failures, or the outer per-turn deadline: the marcher
-    ## doctrine, computed in microseconds, plus the `fallback` event the
-    ## caller writes.
+    ## Two consecutive failures, or the outer per-turn deadline: the neutral
+    ## hold doctrine, plus the `fallback` event the caller writes.
     if outerExpired:
       echo "hive llm: seat ", seat, " out of per-turn budget (",
         client.turnBudgetSeconds, "s)"

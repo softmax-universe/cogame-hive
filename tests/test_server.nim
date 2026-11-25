@@ -15,6 +15,7 @@ const
   ReplayPort = 18732
   NoShowPort = 18733
   ArtifactBarrierPort = 18734
+  ExternalRejectPort = 18735
 
 proc waitForHealth(curl: Curly, port: int, seconds = 20.0): bool =
   let deadline = epochTime() + seconds
@@ -99,6 +100,25 @@ proc runArtifactBarrierServer() =
   putEnv("COGAME_EVENTS_URI", "file://" & work / "barrier-events.jsonl")
   putEnv("COGAME_METRICS_URI", "file://" & work / "barrier-metrics.fifo")
   var runtime = RuntimeConfig(host: "127.0.0.1", port: ArtifactBarrierPort, config: "{}")
+  runtime.resultsUri = getEnv("COGAME_RESULTS_URI")
+  runtime.replayUri = getEnv("COGAME_SAVE_REPLAY_URI")
+  runGameServer(config, runtime)
+
+proc runExternalRejectServer() =
+  let work = getEnv("HIVE_TEST_WORK")
+  var config = defaultGameConfig()
+  config.seed = 42
+  config.episodeTicks = 240
+  config.turnTicks = 240
+  config.playerConnectTimeoutSeconds = 15.0
+  config.bonanzaTicks = @[]
+  config.players = @[PlayerConfig(name: "ExtBad"), PlayerConfig(name: "P2"),
+    PlayerConfig(name: "P3"), PlayerConfig(name: "P4")]
+  config.tokens = @["t0", "t1", "t2", "t3"]
+  putEnv("COGAME_RESULTS_URI", "file://" & work / "ext-results.json")
+  putEnv("COGAME_SAVE_REPLAY_URI", "file://" & work / "ext-replay.json")
+  putEnv("COGAME_EVENTS_URI", "file://" & work / "ext-events.jsonl")
+  var runtime = RuntimeConfig(host: "127.0.0.1", port: ExternalRejectPort, config: "{}")
   runtime.resultsUri = getEnv("COGAME_RESULTS_URI")
   runtime.replayUri = getEnv("COGAME_SAVE_REPLAY_URI")
   runGameServer(config, runtime)
@@ -349,6 +369,65 @@ proc main() =
     discard child.waitForExit()
     report("a blocked diagnostic sink prevents an early results completion marker")
 
+  block externalRejectedFallsBackToHold:
+    ## An external player sending a legacy/invalid action must be rejected with
+    ## `accepted: false` + `cause: "parse_error"`, and fall back to neutral hold
+    ## (`recall: true`, zeroed weights), never silently substituting `marcher`.
+    let child = startProcess(self, options = {poParentStreams},
+      env = {"HIVE_TEST_SERVER": "ext-reject", "HIVE_TEST_WORK": work,
+             "PATH": getEnv("PATH")}.newStringTable)
+    check(waitForHealth(curl, ExternalRejectPort),
+      "external-reject server answers /healthz")
+    var bad = newWebSocket("ws://127.0.0.1:" & $ExternalRejectPort &
+      "/player?slot=0&token=t0")
+    bad.send($ %*{"type": "register", "scripted": newJNull(), "policy": "bad-ext"})
+    var others: seq[WebSocket]
+    for slot in 1 .. 3:
+      var socket = newWebSocket("ws://127.0.0.1:" & $ExternalRejectPort &
+        "/player?slot=" & $slot & "&token=t" & $slot)
+      socket.send($ %*{"type": "register", "prompt": "",
+        "scripted": "marcher", "policy": "m"})
+      others.add(socket)
+    var sawResult = false
+    var sawRejectCause = ""
+    let deadline = epochTime() + 30.0
+    while epochTime() < deadline and not sawResult:
+      let msg = bad.receiveMessage(500)
+      if msg.isNone: continue
+      let frame = parseJson(msg.get().data)
+      case frame{"type"}.getStr()
+      of "decision_request":
+        # Send legacy focus object + missing required fields: must be rejected.
+        bad.send($ %*{"type": "decision", "turn": frame["turn"].getInt(),
+          "action": {"scouts": "70%", "focus": {"bx": 1, "by": 2}},
+          "source": "external"})
+      of "decision_result":
+        checkEqual(frame["accepted"].getBool(), false,
+          "invalid external action is rejected")
+        sawRejectCause = frame{"cause"}.getStr()
+        sawResult = true
+      else: discard
+    check(sawResult, "external player received decision_result")
+    checkEqual(sawRejectCause, "parse_error", "rejection reports parse_error")
+    while epochTime() < deadline and not fileExists(work / "ext-results.json"):
+      sleep(100)
+    check(fileExists(work / "ext-results.json"), "ext-results.json written")
+    let results = parseJson(readFile(work / "ext-results.json"))
+    checkEqual(results["fallback_turns"][0].getInt(), 1,
+      "rejected external turn counted in fallback_turns")
+    checkEqual(results["fallback_causes"][0]["parse_error"].getInt(), 1,
+      "parse_error counted in fallback_causes")
+    let replay = parseJson(readFile(work / "ext-replay.json"))
+    let seat0 = replay["doctrines"][0]
+    checkEqual(seat0["source"].getStr(), "fallback", "installed as fallback")
+    checkEqual(seat0["recall"].getBool(), true, "fallback is neutral hold (recall: true)")
+    checkEqual(seat0["scouts"].getInt(), 0, "fallback does not substitute marcher")
+    bad.close()
+    for socket in others: socket.close()
+    child.terminate()
+    discard child.waitForExit()
+    report("rejected external player action reports parse_error and holds instead of marcher")
+
   ## ---- URI scheme rejection ----------------------------------------------
   block uriSchemes:
     for name in ["COGAME_EVENTS_URI", "COGAME_METRICS_URI"]:
@@ -371,6 +450,7 @@ when isMainModule:
   of "replay": runReplayServer()
   of "noshow": runNoShowServer()
   of "artifact-barrier": runArtifactBarrierServer()
+  of "ext-reject": runExternalRejectServer()
   else:
     main()
     echo "test_server: all checks passed"

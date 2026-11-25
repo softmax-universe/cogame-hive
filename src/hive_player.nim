@@ -36,6 +36,9 @@ when isMainModule:
     echo "hive player: using the ", DefaultScripted, " baseline"
   let policy = getEnv("PLAYER_POLICY_LABEL")
   let kind = parseScriptKind(scripted)
+  if scripted.len > 0 and kind == skNone:
+    stderr.writeLine("hive player: unknown PLAYER_SCRIPTED baseline: " & scripted)
+    quit(1)
   var memory: BaselineMemory
   var lastTurn = -1
   var lastAction: JsonNode

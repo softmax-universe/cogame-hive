@@ -64,5 +64,44 @@ class ScriptedPolicy:
                 "note": note, "say": ""}
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, val in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = val
+    return result
+
+
+def parse_json_object(text: str) -> dict:
+    """Parse exactly one JSON object, bare or inside one outer Markdown code fence."""
+    trimmed = text.strip()
+    if trimmed.startswith("```"):
+        first_nl = trimmed.find("\n")
+        if first_nl < 0:
+            raise ValueError("unterminated markdown code fence")
+        tag = trimmed[3:first_nl].strip().lower()
+        if tag and tag != "json":
+            raise ValueError(f"unsupported markdown code fence tag: {tag}")
+        if not trimmed.endswith("```"):
+            raise ValueError("trailing text after markdown code fence")
+        inner = trimmed[first_nl + 1 : -3]
+        last_nl = inner.rfind("\n")
+        if last_nl < 0 or inner[last_nl + 1 :].strip(" \t\r") != "":
+            raise ValueError("closing markdown fence must sit on its own line")
+        source = inner[:last_nl].strip()
+    else:
+        source = trimmed
+    if not source.startswith("{"):
+        raise ValueError("reply must be a single JSON object")
+    decoder = json.JSONDecoder(object_pairs_hook=_no_duplicate_keys)
+    value, end = decoder.raw_decode(source)
+    if source[end:].strip():
+        raise ValueError("unexpected trailing content after JSON object")
+    if not isinstance(value, dict):
+        raise ValueError("reply must be a single JSON object")
+    return value
+
+
 def prompt_for(view: dict, strategy: str, selection: PromptSelection) -> tuple[str, str]:
     return selection.system_prompt(), strategy.strip()[:4000] + "\n\n" + json.dumps(view, indent=1, ensure_ascii=False)

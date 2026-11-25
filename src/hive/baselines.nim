@@ -39,11 +39,10 @@ const ShippedMarcher* = MarcherParams(
   layFood: 88, layHome: 52, focusWeight: 70)
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values, bullwhip's shape: "1"/"true"/"yes"/"marcher"
-  ## play the marcher, "driftling" the driftling, anything else nothing.
+  ## Exact scripted baseline names only: "marcher", "driftling", or empty.
   case text.strip().toLowerAscii()
-  of "1", "true", "yes", "marcher": skMarcher
-  of "driftling", "drift": skDriftling
+  of "marcher": skMarcher
+  of "driftling": skDriftling
   else: skNone
 
 proc blockDistance*(ax, ay, bx, by: int): int {.inline.} =

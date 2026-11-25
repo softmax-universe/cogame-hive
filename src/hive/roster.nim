@@ -35,8 +35,8 @@ type
 proc initRoster*(tokens: seq[string]): Roster =
   result.tokens = tokens
   for seat in 0 ..< Colonies:
-    ## A seat that never registers plays marcher as the game fallback.
-    result.seats[seat] = Seat(scripted: skMarcher, policyLabel: "")
+    ## Unregistered seats do not silently receive a scripted baseline.
+    result.seats[seat] = Seat(scripted: skNone, policyLabel: "")
 
 proc authorize*(roster: Roster, slot: int, token: string): JoinError =
   if slot < 0 or slot >= Colonies or slot >= roster.tokens.len:
@@ -63,17 +63,17 @@ proc register*(
   for character in selectedModel:
     if character notin {'a'..'z', 'A'..'Z', '0'..'9', '-', '_', '.', '/', ':'}:
       raise newException(HiveError, "invalid register.model character")
-  let kind = parseScriptKind(scripted)
+  let trimmedScripted = scripted.strip()
+  let kind = parseScriptKind(trimmedScripted)
+  if trimmedScripted.len > 0 and kind == skNone:
+    raise newException(HiveError, "unknown register.scripted baseline: " & trimmedScripted)
   roster.seats[slot].model = selectedModel
   roster.seats[slot].external = external
   let cleaned = prompt.strip()
   roster.seats[slot].prompt =
     if cleaned.runeLen <= 4000: cleaned
     else: cleaned.runeSubStr(0, 4000)
-  roster.seats[slot].scripted =
-    if kind != skNone: kind
-    elif external or roster.seats[slot].prompt.len > 0: skNone
-    else: skMarcher
+  roster.seats[slot].scripted = kind
   roster.seats[slot].policyLabel = truncatePolicy(policy)
   roster.seats[slot].registered = true
 

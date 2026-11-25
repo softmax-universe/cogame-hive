@@ -607,17 +607,17 @@ proc main() =
     discard parseReplayBytes($partial)
     report("a sim fault scores 0.25 everywhere and still writes a replay")
 
-  block unregisteredSeatPlaysMarcher:
+  block unregisteredSeatDoesNotPlayMarcher:
     var seats = initRoster(@["t0", "t1", "t2", "t3"])
     for seat in 0 ..< Colonies:
-      checkEqual(seats.seats[seat].scripted, skMarcher,
-        "a seat that never registers defaults to the marcher")
-      checkEqual(seats.seats[seat].policyKind(), "scripted",
-        "and is reported as scripted")
+      checkEqual(seats.seats[seat].scripted, skNone,
+        "a seat that never registers does not silently default to marcher")
       check(not seats.seats[seat].everConnected, "and never connected")
-    seats.register(0, "", "")
+    seats.register(0, "marcher", "")
     checkEqual(seats.seats[0].scripted, skMarcher,
-      "registering with neither field is also the marcher")
+      "registering with marcher selects the marcher baseline")
+    checkEqual(seats.seats[0].policyKind(), "scripted",
+      "and is reported as scripted")
     seats.register(1, "", "my-policy", true)
     checkEqual(seats.seats[1].scripted, skNone, "a player chooses its policy")
     checkEqual(seats.seats[1].policyKind(), "external", "reported as external")
@@ -628,9 +628,15 @@ proc main() =
       "an ordinary player is registered as an external doctrine source")
     checkEqual(seats.seats[3].scripted, skNone,
       "an external seat does not become a scripted seat")
-    report("an unregistered seat plays the marcher for the whole match")
+    var rejected = false
+    try:
+      seats.register(0, "true", "")
+    except HiveError:
+      rejected = true
+    check(rejected, "legacy scripted alias is rejected on registration")
+    report("unregistered seats do not silently play marcher and legacy aliases are rejected")
 
-  block disconnectDegradesAndRevives:
+  block disconnectAndAuth:
     var seats = initRoster(@["t0", "t1", "t2", "t3"])
     seats.register(0, "", "", true)
     checkEqual(seats.authorize(0, "t0"), jeNone, "a good token is accepted")
@@ -639,16 +645,12 @@ proc main() =
       "a duplicate connection is refused")
     checkEqual(seats.authorize(0, "wrong"), jeBadToken, "a bad token is refused")
     checkEqual(seats.authorize(9, "t0"), jeBadSlot, "a bad slot is refused")
-    ## The server's rule: a disconnected seat degrades to the marcher.
-    proc effective(seat: Seat): ScriptKind =
-      if seat.connected: seat.scripted else: skMarcher
-    checkEqual(effective(seats.seats[0]), skNone, "connected: the player plays")
     seats.seats[0].connected = false
-    checkEqual(effective(seats.seats[0]), skMarcher,
-      "disconnected: the doctrine source degrades to the marcher")
+    checkEqual(seats.seats[0].scripted, skNone,
+      "disconnected external seat does not become a scripted baseline")
     seats.seats[0].connected = true
-    checkEqual(effective(seats.seats[0]), skNone, "and revives on reconnect")
-    report("a mid-match disconnect degrades to the marcher and revives")
+    checkEqual(seats.seats[0].scripted, skNone, "and revives on reconnect")
+    report("auth rules hold and disconnect does not silently substitute marcher")
 
   block policyRuneCap:
     var seats = initRoster(@["t0", "t1", "t2", "t3"])

@@ -378,7 +378,16 @@ def main():
                             ws.send(json.dumps(register))
                         if packet.get("type") != "decision_request":
                             continue
-                        action = {"note": "é 😀", "say": "KEEP"}
+                        action = {
+                            "scouts": 40,
+                            "trail_gain": 50,
+                            "poach": 15,
+                            "spread": 40,
+                            "lay_food": 70,
+                            "lay_home": 50,
+                            "note": "é 😀",
+                            "say": "KEEP",
+                        }
                         if packet["turn"] == 0 and not packet.get("retry"):
                             action["note"] = "\udc00"
                         reply = json.dumps(
@@ -507,6 +516,11 @@ def main():
                                     "source": "external",
                                     "action": {
                                         "scouts": 40,
+                                        "trail_gain": 50,
+                                        "poach": 15,
+                                        "spread": 40,
+                                        "lay_food": 70,
+                                        "lay_home": 50,
                                         "note": "ownership-external",
                                         "say": "",
                                     },

@@ -117,13 +117,14 @@ proc main() =
 
   block scriptKindParsing:
     checkEqual(parseScriptKind("marcher"), skMarcher, "marcher")
-    checkEqual(parseScriptKind("1"), skMarcher, "1 means marcher")
-    checkEqual(parseScriptKind("TRUE"), skMarcher, "true means marcher")
-    checkEqual(parseScriptKind("yes"), skMarcher, "yes means marcher")
     checkEqual(parseScriptKind("driftling"), skDriftling, "driftling")
     checkEqual(parseScriptKind(""), skNone, "empty means none")
+    checkEqual(parseScriptKind("1"), skNone, "legacy alias 1 is rejected")
+    checkEqual(parseScriptKind("TRUE"), skNone, "legacy alias TRUE is rejected")
+    checkEqual(parseScriptKind("yes"), skNone, "legacy alias yes is rejected")
+    checkEqual(parseScriptKind("drift"), skNone, "legacy alias drift is rejected")
     checkEqual(parseScriptKind("nonsense"), skNone, "anything else is none")
-    report("PLAYER_SCRIPTED parsing follows the documented table")
+    report("PLAYER_SCRIPTED parsing accepts only exact baseline names")
 
   block ladderSpread:
     ## Two marcher seats against two driftling seats at seed 42: the match

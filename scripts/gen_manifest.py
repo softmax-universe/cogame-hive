@@ -428,8 +428,7 @@ def main() -> None:
                     "a weak trail, inverts to a hard pump the moment a cache "
                     "shows up in its sources list, and recalls for one turn "
                     "when deliveries collapse. It reads its private view "
-                    "and sends one doctrine on each turn. The game uses "
-                    "marcher when a player misses its deadline."
+                    "and sends one doctrine on each turn."
                 ),
                 "image": image,
                 "run": ["/bin/hive-player"],

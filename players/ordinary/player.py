@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import websocket
 from capture import Capture
-from policy import ScriptedPolicy, prompt_for
+from policy import ScriptedPolicy, parse_json_object, prompt_for
 from prompts import PromptSelection
 
 
@@ -19,11 +19,15 @@ def choose(
     turn: dict, generator, marcher: ScriptedPolicy, driftling: ScriptedPolicy, strategy: str, scripted: str
 ) -> tuple[dict, str, str, str]:
     view = turn["view"]
-    candidates = [marcher.decide(view), driftling.decide(view)]
     selection = PromptSelection.model_validate(turn["prompt_selection"])
     system, user = prompt_for(view, strategy, selection)
     if scripted:
-        return candidates[1 if scripted == "driftling" else 0], "scripted", system, user
+        kind = scripted.strip().lower()
+        if kind == "marcher":
+            return marcher.decide(view), "scripted", system, user
+        if kind == "driftling":
+            return driftling.decide(view), "scripted", system, user
+        raise ValueError(f"unknown PLAYER_SCRIPTED baseline: {scripted}")
     if generator:
         completion = generator(
             [
@@ -31,9 +35,7 @@ def choose(
                 {"role": "user", "content": user},
             ]
         )
-        action = json.loads(completion)
-        if not isinstance(action, dict):
-            raise ValueError("trained Hive decision must be a JSON object")
+        action = parse_json_object(completion)
         return action, "trained", system, user
     if strategy:
         endpoint = os.environ.get("COWORLD_LLM_ENDPOINT", "").rstrip("/")
@@ -56,9 +58,15 @@ def choose(
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=10) as response:
-            action = json.loads(json.load(response)["content"][0]["text"])
+            payload = json.load(response)
+            text = "".join(
+                block.get("text", "")
+                for block in payload.get("content", [])
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+            action = parse_json_object(text)
         return action, "llm", system, user
-    return candidates[0], "scripted", system, user
+    raise ValueError("ordinary player requires PLAYER_SCRIPTED, PLAYER_PROMPT, or HIVE_ADAPTER_DIR")
 
 
 def main() -> None:
@@ -96,7 +104,7 @@ def main() -> None:
             time.sleep(0.25)
     socket.settimeout(120)
     socket.send(registration)
-    pending: dict[int, tuple[str, str, dict, str]] = {}
+    pending: dict[int, tuple[str, str, dict | None, str]] = {}
     while True:
         opcode, data = socket.recv_data(control_frame=True)
         if opcode == websocket.ABNF.OPCODE_CLOSE:
@@ -115,14 +123,20 @@ def main() -> None:
             selection = PromptSelection.model_validate(frame["prompt_selection"])
             socket.send(registration)
         elif kind == "decision_request":
-            if frame["turn"] not in pending:
-                action, source, system, user = choose(frame, generator, marcher, driftling, strategy, scripted)
-                pending[frame["turn"]] = (system, user, action, source)
+            if frame["turn"] not in pending or frame.get("retry"):
+                try:
+                    action, source, system, user = choose(frame, generator, marcher, driftling, strategy, scripted)
+                    pending[frame["turn"]] = (system, user, action, source)
+                except (ValueError, json.JSONDecodeError, OSError) as exc:
+                    if backend == "scripted":
+                        raise
+                    print(f"Hive ordinary player rejected reply on turn {frame['turn']}: {exc}", flush=True)
+                    pending[frame["turn"]] = ("", "", None, backend)
             _, _, action, source = pending[frame["turn"]]
             socket.send(json.dumps({"type": "decision", "turn": frame["turn"], "action": action, "source": source}))
         elif kind == "decision_result":
             system, user, action, source = pending.pop(frame["turn"])
-            if artifact and frame["accepted"]:
+            if artifact and frame["accepted"] and action is not None:
                 artifact.record(system, user, action, source, frame["turn"], selection.metadata(system, user))
     socket.close()
     print(f"Hive ordinary player finished: slot={slot} backend={backend}", flush=True)

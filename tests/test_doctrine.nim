@@ -1,114 +1,140 @@
-## Tolerant parsing, repair, and RUNE-boundary truncation. A byte-truncated
-## multi-byte character renders fine in a browser and fails a strict JSON
-## parser, which is exactly the bug that loses a replay.
+## Strict doctrine parsing, optional-field defaults, and RUNE-boundary
+## truncation. A byte-truncated multi-byte character renders fine in a browser
+## and fails a strict JSON parser, which is exactly the bug that loses a replay.
 
 import std/[json, strutils, unicode]
 import support/helpers
+import hive/llm
+
+const BaseRequired =
+  "\"scouts\": 20, \"trail_gain\": 80, \"poach\": 5, \"spread\": 30, " &
+  "\"lay_food\": 90, \"lay_home\": 60"
 
 proc parsed(text: string, previous = defaultDoctrine(),
     hasPrevious = false): Doctrine =
   parseDoctrine(text, previous, hasPrevious)
 
+proc checkRejected(text: string, label: string,
+    previous = defaultDoctrine(), hasPrevious = false) =
+  var raised = false
+  try:
+    discard parsed(text, previous, hasPrevious)
+  except HiveError:
+    raised = true
+  check(raised, label)
+
 proc main() =
-  block prosePrefixed:
-    let doctrine = parsed("Sure! Here is my plan for this turn.\n" &
-      "{\"scouts\": 20, \"trail_gain\": 80, \"poach\": 5, \"spread\": 30, " &
-      "\"lay_food\": 90, \"lay_home\": 60, \"recall\": false, " &
-      "\"focus\": [3, 4], \"focus_weight\": 70, \"note\": \"go\", " &
-      "\"say\": \"go\"}\nHope that helps!")
-    checkEqual(doctrine.scouts, 20, "prose-prefixed JSON parses")
-    checkEqual(doctrine.trailGain, 80, "trail_gain")
-    checkEqual(doctrine.focusBx, 3, "focus bx")
-    report("prose before and after the object is tolerated")
+  block bareAndOuterFencedObjects:
+    let bare = parsed("{" & BaseRequired &
+      ", \"recall\": false, \"focus\": [3, 4], \"focus_weight\": 70, " &
+      "\"note\": \"go\", \"say\": \"go\"}")
+    checkEqual(bare.scouts, 20, "bare JSON scouts")
+    checkEqual(bare.trailGain, 80, "bare JSON trail_gain")
+    checkEqual(bare.focusBx, 3, "bare JSON focus bx")
+    checkEqual(bare.focusBy, 4, "bare JSON focus by")
+    checkEqual(bare.focusWeight, 70, "bare JSON focus_weight")
 
-  block fenced:
-    let doctrine = parsed("```json\n{\"scouts\": 33, \"trail_gain\": 44}\n```")
-    checkEqual(doctrine.scouts, 33, "fenced JSON parses")
-    checkEqual(doctrine.trailGain, 44, "fenced trail_gain")
-    report("markdown fences are stripped")
+    let jsonFenced = parsed("```json\n{" & BaseRequired & "}\n```")
+    checkEqual(jsonFenced.scouts, 20, "json-fenced object parses")
+    checkEqual(jsonFenced.trailGain, 80, "json-fenced trail_gain")
 
-  block percentStrings:
-    let doctrine = parsed("{\"scouts\": \"70%\", \"trail_gain\": \"12\", " &
-      "\"poach\": 8.9}")
-    checkEqual(doctrine.scouts, 70, "\"70%\" parses as 70")
-    checkEqual(doctrine.trailGain, 12, "a numeric string parses")
-    checkEqual(doctrine.poach, 8, "a float truncates to an int")
-    report("numeric strings, percentages and floats are accepted")
+    let upperFenced = parsed("```JSON\n{" & BaseRequired & "}\n```")
+    checkEqual(upperFenced.scouts, 20, "case-insensitive json fence parses")
 
-  block focusShapes:
-    checkEqual(parsed("{\"focus\": {\"bx\": 9, \"by\": 5}, " &
-      "\"focus_weight\": 50}").focusBx, 9, "focus as an object")
-    checkEqual(parsed("{\"focus\": {\"bx\": 9, \"by\": 5}, " &
-      "\"focus_weight\": 50}").focusBy, 5, "focus as an object, by")
-    let clamped = parsed("{\"focus\": [99, 99], \"focus_weight\": 50}")
-    checkEqual(clamped.focusBx, BlockCols - 1, "an out-of-range bx clamps")
-    checkEqual(clamped.focusBy, BlockRows - 1, "an out-of-range by clamps")
-    let arity = parsed("{\"focus\": [1, 2, 3], \"focus_weight\": 50}")
-    check(not arity.hasFocus, "the wrong arity makes focus null")
-    checkEqual(arity.focusWeight, 0, "focus_weight is forced 0 with no focus")
-    let text = parsed("{\"focus\": \"middle\", \"focus_weight\": 50}")
-    check(not text.hasFocus, "a non-array, non-object focus is null")
-    report("focus accepts both shapes, clamps, and nulls anything else")
+    let plainFenced = parsed("```\n{" & BaseRequired & "}\n```")
+    checkEqual(plainFenced.scouts, 20, "plain-fenced object parses")
+    report("bare JSON and single outer Markdown code fences (json or plain) parse")
 
-  block integerRepair:
-    let clampedInts = parsed("{\"scouts\": -40, \"trail_gain\": 300}")
-    checkEqual(clampedInts.scouts, 0, "a negative integer clamps to 0")
-    checkEqual(clampedInts.trailGain, 100, "a 300-valued integer clamps to 100")
-    report("out-of-range integers clamp")
+  block surroundingProseAndAmbiguousRepliesRejected:
+    let validObj = "{" & BaseRequired & "}"
+    checkRejected("Sure! Here is my plan:\n" & validObj,
+      "leading prose before bare JSON is rejected")
+    checkRejected(validObj & "\nHope that helps!",
+      "trailing prose after bare JSON is rejected")
+    checkRejected("Plan:\n```json\n" & validObj & "\n```",
+      "leading prose before markdown fence is rejected")
+    checkRejected("```json\n" & validObj & "\n```\nDone.",
+      "trailing prose after markdown fence is rejected")
+    checkRejected("```python\n" & validObj & "\n```",
+      "non-json markdown fence tag is rejected")
+    checkRejected(validObj & " " & validObj,
+      "multiple bare JSON objects are rejected")
+    checkRejected("```json\n" & validObj & "\n```\n```json\n" & validObj & "\n```",
+      "multiple fenced JSON objects are rejected")
+    checkRejected("{" & BaseRequired & ", \"scouts\": 21}",
+      "duplicate JSON keys are rejected")
+    checkRejected("[" & validObj & "]",
+      "non-object JSON array is rejected")
+    report("surrounding prose, extra objects, wrong fences and duplicate keys are rejected")
 
-  block missingFields:
-    let turnZero = parsed("{\"note\": \"nothing else\"}")
-    checkEqual(turnZero.scouts, DefaultScouts, "turn 0 default scouts")
-    checkEqual(turnZero.trailGain, DefaultTrailGain, "turn 0 default trail")
-    checkEqual(turnZero.poach, DefaultPoach, "turn 0 default poach")
-    checkEqual(turnZero.spread, DefaultSpread, "turn 0 default spread")
-    checkEqual(turnZero.layFood, DefaultLayFood, "turn 0 default lay_food")
-    checkEqual(turnZero.layHome, DefaultLayHome, "turn 0 default lay_home")
+  block compatibilityShimsRejected:
+    checkRejected("{\"scouts\": \"70%\", \"trail_gain\": 50, \"poach\": 10, " &
+      "\"spread\": 30, \"lay_food\": 70, \"lay_home\": 50}",
+      "percentage string is rejected")
+    checkRejected("{\"scouts\": \"12\", \"trail_gain\": 50, \"poach\": 10, " &
+      "\"spread\": 30, \"lay_food\": 70, \"lay_home\": 50}",
+      "numeric string is rejected")
+    checkRejected("{\"scouts\": 8.9, \"trail_gain\": 50, \"poach\": 10, " &
+      "\"spread\": 30, \"lay_food\": 70, \"lay_home\": 50}",
+      "float is rejected for integer field")
+    checkRejected("{\"scouts\": true, \"trail_gain\": 50, \"poach\": 10, " &
+      "\"spread\": 30, \"lay_food\": 70, \"lay_home\": 50}",
+      "boolean is rejected for integer field")
+    checkRejected("{" & BaseRequired & ", \"focus\": {\"bx\": 9, \"by\": 5}, \"focus_weight\": 50}",
+      "legacy focus object shape is rejected")
+    checkRejected("{" & BaseRequired & ", \"focus\": [99, 99], \"focus_weight\": 50}",
+      "out-of-range focus is rejected rather than clamped")
+    checkRejected("{" & BaseRequired & ", \"focus\": [1, 2, 3], \"focus_weight\": 50}",
+      "wrong-arity focus is rejected rather than nulled")
+    checkRejected("{" & BaseRequired & ", \"focus\": \"middle\", \"focus_weight\": 50}",
+      "string focus is rejected")
+    checkRejected("{" & BaseRequired & ", \"focus\": null, \"focus_weight\": 50}",
+      "non-zero focus_weight with null focus is rejected")
+    checkRejected("{\"scouts\": -1, \"trail_gain\": 50, \"poach\": 10, " &
+      "\"spread\": 30, \"lay_food\": 70, \"lay_home\": 50}",
+      "negative integer is rejected rather than clamped")
+    checkRejected("{\"scouts\": 101, \"trail_gain\": 50, \"poach\": 10, " &
+      "\"spread\": 30, \"lay_food\": 70, \"lay_home\": 50}",
+      "over-100 integer is rejected rather than clamped")
+    checkRejected("{" & BaseRequired & ", \"recall\": \"true\"}",
+      "string recall is rejected")
+    checkRejected("{" & BaseRequired & ", \"recall\": 1}",
+      "integer recall is rejected")
+    checkRejected("{" & BaseRequired & ", \"unknown\": 1}",
+      "unknown extra field is rejected")
+    report("legacy compatibility shims, type coercions, clamping and unknown fields are rejected")
+
+  block requiredAndOptionalFields:
+    checkRejected("{\"note\": \"nothing else\"}",
+      "missing required fields are rejected")
+    checkRejected("{\"poach\": 5}",
+      "partial doctrine does not silently carry over previous turn")
+
     var previous = defaultDoctrine()
-    previous.scouts = 11
-    previous.trailGain = 77
-    let turnSeven = parsed("{\"poach\": 5}", previous, true)
-    checkEqual(turnSeven.scouts, 11, "a missing field keeps last turn's value")
-    checkEqual(turnSeven.trailGain, 77, "…for every integer field")
-    checkEqual(turnSeven.poach, 5, "…and the one that was sent is used")
-    ## focus_weight is "as scouts, default 0" in the note's repair table: a
-    ## missing one keeps LAST TURN'S value, not a literal 0. It only forces
-    ## to 0 when focus itself came out null.
     previous.hasFocus = true
     previous.focusBx = 4
     previous.focusBy = 6
     previous.focusWeight = 80
-    let keptWeight = parsed("{\"poach\": 5, \"focus\": [4, 6]}", previous, true)
-    checkEqual(keptWeight.focusWeight, 80,
-      "a missing focus_weight keeps last turn's value")
-    let zeroed = parsed("{\"poach\": 5, \"focus\": null}", previous, true)
-    checkEqual(zeroed.focusWeight, 0, "…but a null focus still forces it to 0")
-    let sent = parsed("{\"focus\": [4, 6], \"focus_weight\": 25}", previous, true)
-    checkEqual(sent.focusWeight, 25, "…and a sent focus_weight wins")
-    report("missing fields fall back to the previous turn, then the default")
+    let minimal = parsed("{" & BaseRequired & "}", previous, true)
+    checkEqual(minimal.recall, false, "omitted recall defaults to false")
+    check(not minimal.hasFocus, "omitted focus defaults to null")
+    checkEqual(minimal.focusWeight, 0, "omitted focus_weight defaults to 0 (no silent carryover)")
+    checkEqual(minimal.note, "", "omitted note defaults to empty")
+    checkEqual(minimal.say, "", "omitted say defaults to empty")
 
-  block recallShapes:
-    check(parsed("{\"recall\": \"true\"}").recall, "recall as a string")
-    check(parsed("{\"recall\": 1}").recall, "recall as 1")
-    check(not parsed("{\"recall\": \"false\"}").recall, "recall false string")
-    check(not parsed("{\"recall\": 0}").recall, "recall as 0")
-    var previous = defaultDoctrine()
     previous.recall = true
-    check(not parsed("{\"recall\": true}", previous, true).recall,
+    check(not parsed("{" & BaseRequired & ", \"recall\": true}", previous, true).recall,
       "recall may not run two turns in a row")
-    report("recall accepts every documented shape and never repeats")
+    report("required fields are enforced and genuine optional fields use clean defaults")
 
   block runeTruncation:
     let long = repeat("x", 400)
-    let note = parsed("{\"note\": \"" & long & "\"}").note
+    let note = parsed("{" & BaseRequired & ", \"note\": \"" & long & "\"}").note
     checkEqual(note.runeLen, MaxNoteRunes, "a 400-character note cuts to 140")
 
-    ## A `say` whose 32nd and 33rd runes are a 4-byte emoji: the cut must land
-    ## on the RUNE boundary, and the result must still round-trip through
-    ## %* / $ / parseJson and be valid UTF-8.
     let say = repeat("a", 31) & "\u{1F41C}\u{1F41C}" & "tail"
     checkEqual(say.runeLen, 37, "the fixture is 37 runes")
-    let cut = parsed("{\"say\": \"" & say & "\"}").say
+    let cut = parsed("{" & BaseRequired & ", \"say\": \"" & say & "\"}").say
     checkEqual(cut.runeLen, MaxSayRunes, "say cuts to exactly 32 runes")
     checkEqual(cut, repeat("a", 31) & "\u{1F41C}",
       "the cut lands on the rune boundary, keeping the whole emoji")
@@ -120,9 +146,7 @@ proc main() =
     checkEqual(round["say"].getStr(), cut, "the truncated say round-trips")
     checkEqual(validateUtf8($doctrine.toJson()), -1,
       "the encoded doctrine is valid UTF-8")
-    ## fallback.detail is the fifth capped string and the only one fed by a
-    ## transport error message, which is exactly where a multi-byte character
-    ## can land on the cap. 200 runes, on a rune boundary, still valid UTF-8.
+
     let detail = repeat("\u{00E9}", MaxDetailRunes - 1) & "\u{1F41C}" &
       repeat("z", 40)
     check(detail.runeLen > MaxDetailRunes, "the fixture is over the cap")
@@ -139,34 +163,12 @@ proc main() =
       "and it round-trips through the event encoder")
     report("truncation lands on rune boundaries and round-trips as UTF-8")
 
-  block unrecoverable:
-    var raised = false
-    try:
-      discard parsed("I would rather not answer this one.")
-    except HiveError:
-      raised = true
-    check(raised, "a reply with no JSON object at all raises")
-    raised = false
-    try:
-      discard parsed("{\"weather\": \"sunny\"}")
-    except HiveError:
-      raised = true
-    check(raised, "an object with no recognised doctrine key raises")
-    report("only an unrecoverable reply raises, which is what triggers retry")
-
-  block retryThenFallback:
-    ## The engine contract: attempt 1 fails, exactly one retry, then the
-    ## marcher doctrine plus a `fallback` event. `tests/test_engine.nim` runs
-    ## it end to end against a fake transport; here we pin the shape of the
-    ## fallback itself.
-    var memory: BaselineMemory
-    let view = %*{"turn": 0, "you": {"nest_block": [2, 1],
-      "delivered_last_turn": 0, "last_doctrine": newJNull()},
-      "sources": newJArray()}
-    let fallback = scriptedResolved(view, skMarcher, 0, memory, dsFallback)
+  block neutralHoldFallback:
+    let fallback = holdFallbackDoctrine()
     checkEqual($fallback.source, "fallback", "the fallback is labelled")
+    check(fallback.doctrine.recall, "the fallback is the neutral hold doctrine")
     check(fallback.doctrine.isLegal(), "the fallback doctrine is legal")
-    report("two consecutive failures land on a legal marcher doctrine")
+    report("failures land on the legal neutral hold doctrine, never marcher")
 
 main()
 echo "test_doctrine: all checks passed"
