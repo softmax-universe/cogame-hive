@@ -28,9 +28,11 @@ proc main() =
       "certification.players seats four")
     checkEqual(cert["game_config"]["players"].len, Colonies,
       "certification.game_config.players seats four")
-    for entry in cert["players"]:
-      checkEqual(entry["player_id"].getStr(), "baseline",
-        "the certification fixture seats the bundled baseline")
+    checkEqual(cert["players"][0]["player_id"].getStr(), "llm",
+      "certification seat 0 seats the native model player")
+    for idx in 1 ..< cert["players"].len:
+      checkEqual(cert["players"][idx]["player_id"].getStr(), "baseline",
+        "remaining certification seats use the bundled baseline")
     checkEqual(cert["game_config"]["seed"].getInt(), 42, "cert seed")
     checkEqual(cert["game_config"]["episodeTicks"].getInt(), 960, "cert ticks")
     report("num_agents is 4 in every variant and in the cert fixture")
@@ -77,6 +79,13 @@ proc main() =
       "game.runnable.type is required and must be 'game'")
     check(not game["runnable"]["env"].hasKey("ANTHROPIC_API_KEY_URI"),
       "the game receives no inference credential")
+    checkEqual(game["runnable"]["env"]["COWORLD_LLM_ENABLED"].getStr(), "true",
+      "the game runnable enables hosted LLM inference")
+    checkEqual(game["runnable"]["env"]["COWORLD_LLM_MODEL"].getStr(),
+      "anthropic/claude-haiku-4.5",
+      "the game runnable declares the default hosted model")
+    check(not game["runnable"]["env"].hasKey("COWORLD_LLM_ENDPOINT"),
+      "the game runnable never ships a local endpoint")
     ## Bundled players live at the TOP level, not under `game`.
     check(not game.hasKey("player"), "game.player must NOT exist")
     check(manifest.hasKey("player") and manifest["player"].len >= 2,
@@ -89,6 +98,13 @@ proc main() =
     check(nativeModel["description"].getStr().len > 0, "and a description")
     checkEqual(nativeModel["run"][0].getStr(), "/bin/hive-player",
       "native model player uses the genuine native player entrypoint")
+    checkEqual(nativeModel["env"]["COWORLD_LLM_ENABLED"].getStr(), "true",
+      "native model player enables hosted LLM inference")
+    checkEqual(nativeModel["env"]["COWORLD_LLM_MODEL"].getStr(),
+      "anthropic/claude-haiku-4.5",
+      "native model player declares the default hosted model")
+    check(not nativeModel["env"].hasKey("COWORLD_LLM_ENDPOINT"),
+      "native model player never ships a local endpoint")
     check(nativeModel["env"].hasKey("PLAYER_PROMPT") and
       nativeModel["env"]["PLAYER_PROMPT"].getStr().len > 0,
       "native model player sets PLAYER_PROMPT")
@@ -105,20 +121,26 @@ proc main() =
     checkEqual(bundled["run"][0].getStr(), "/bin/hive-player",
       "the scripted baseline entrypoint")
     checkEqual(bundled["env"]["PLAYER_SCRIPTED"].getStr(), "marcher",
-      "the certification baseline is the marcher, no LLM")
+      "the scripted baseline is the marcher, no LLM")
     checkEqual(bundled["image"].getStr(), game["runnable"]["image"].getStr(),
       "one image, two entrypoints")
-    ## Every certification slot must reference a declared player and remain
-    ## purely scripted offline (`baseline`).
+    ## Every certification slot must reference a declared player, seat 0 must
+    ## use the first declared (native model) ID, and EVERY declared player ID
+    ## must occupy at least one certification seat.
     var declaredIds: seq[string]
     for entry in manifest["player"]:
       declaredIds.add(entry["id"].getStr())
+    var seatedIds: seq[string]
     for slot in manifest["certification"]["players"]:
       let pid = slot["player_id"].getStr()
       check(pid in declaredIds,
         "certification player_id " & pid & " is declared in manifest.player")
-      checkEqual(pid, "baseline",
-        "offline certification remains purely scripted")
+      seatedIds.add(pid)
+    checkEqual(seatedIds[0], declaredIds[0],
+      "certification seat 0 uses the first declared player ID")
+    for pid in declaredIds:
+      check(pid in seatedIds,
+        "declared player_id " & pid & " occupies at least one certification seat")
     report("the image placeholder matches the compose service name")
 
   block topLevelShape:

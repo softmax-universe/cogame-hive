@@ -162,8 +162,28 @@ with open(os.path.join(work, "config.json"), "w") as fh:
 by_id = {p.get("id"): p for p in (manifest.get("player") or [])}
 extra_env = [kv for kv in (os.environ.get("SMOKE_EXTRA_ENV") or "").split() if "=" in kv]
 
+# Offline CI smoke has no LLM credentials, while the release certification
+# fixture seats the native `llm` model player at seat 0 alongside `baseline`.
+# Nominate scripted seats explicitly for offline smoke unless SMOKE_PLAYER_IDS
+# is provided by the caller.
+smoke_player_ids_raw = (os.environ.get("SMOKE_PLAYER_IDS") or "").strip()
+if smoke_player_ids_raw:
+    smoke_player_ids = [pid.strip() for pid in smoke_player_ids_raw.split(",") if pid.strip()]
+    if len(smoke_player_ids) != seats:
+        raise SystemExit(
+            f"SEAT-COUNT FAIL: SMOKE_PLAYER_IDS names {len(smoke_player_ids)} seats "
+            f"but num_agents is {seats}."
+        )
+else:
+    scripted_id = os.environ.get("SMOKE_SCRIPTED_PLAYER_ID", "baseline").strip() or "baseline"
+    if scripted_id not in by_id:
+        raise SystemExit(
+            f"SMOKE FAIL: offline scripted player_id {scripted_id!r} is not declared in manifest.player"
+        )
+    smoke_player_ids = [scripted_id] * seats
+
 for slot in range(seats):
-    player_id = cert_players[slot].get("player_id") if slot < len(cert_players) else None
+    player_id = smoke_player_ids[slot]
     entry = by_id.get(player_id) or {}
     env_args = []
     for key, value in (entry.get("env") or {}).items():
