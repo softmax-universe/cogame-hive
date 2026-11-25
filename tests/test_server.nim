@@ -2,7 +2,7 @@
 ## HIVE_TEST_SERVER set, so the server runs in its own process (it calls
 ## quit(0) after the shutdown grace) while the parent does the assertions.
 
-import std/[json, options, os, osproc, strtabs, strutils, times]
+import std/[json, options, os, osproc, strtabs, strutils, times, unicode]
 import curly
 import mummy except WebSocket
 import mummy/routers
@@ -34,6 +34,30 @@ proc waitForHealth(curl: Curly, port: int, seconds = 20.0): bool =
       discard
     sleep(150)
   false
+
+proc waitForExitBounded(child: Process, seconds = 60.0): tuple[exited: bool, code: int] =
+  let deadline = epochTime() + seconds
+  while epochTime() < deadline and child.running:
+    sleep(100)
+  if child.running:
+    child.terminate()
+    return (false, child.waitForExit())
+  (true, child.waitForExit())
+
+proc checkGamePlayerFailure(failure: JsonNode, expectedSlot: int, expectedKind: string) =
+  checkEqual(failure.kind, JObject, "player_failure.json is a JSON object")
+  checkEqual(failure.len, 3, "closed GamePlayerFailure has exactly 3 keys (no extra fields)")
+  check(failure.hasKey("failed_policy_index"), "requires failed_policy_index")
+  check(failure.hasKey("message"), "requires message")
+  check(failure.hasKey("kind"), "requires kind")
+  checkEqual(failure["failed_policy_index"].kind, JInt, "failed_policy_index is int")
+  checkEqual(failure["failed_policy_index"].getInt(), expectedSlot,
+    "failed_policy_index matches offending slot")
+  checkEqual(failure["message"].kind, JString, "message is string")
+  let msgLen = failure["message"].getStr().runeLen
+  check(msgLen >= 1 and msgLen <= 2000, "message length is 1..2000 runes")
+  checkEqual(failure["kind"].kind, JString, "kind is string")
+  checkEqual(failure["kind"].getStr(), expectedKind, "kind matches expected failure class")
 
 proc runLiveServer() =
   let work = getEnv("HIVE_TEST_WORK")
@@ -95,7 +119,7 @@ proc runArtifactBarrierServer() =
   var config = defaultGameConfig()
   config.seed = 42
   config.episodeTicks = 480
-  config.playerConnectTimeoutSeconds = 1.0
+  config.playerConnectTimeoutSeconds = 15.0
   config.wallClockBudgetSeconds = 40.0
   config.bonanzaTicks = @[]
   config.players = @[PlayerConfig(name: "P1"), PlayerConfig(name: "P2"),
@@ -148,6 +172,11 @@ proc runLlmRoundTripServer(port, sidecarPort: int, prefix: string, ticks: int) =
   putEnv("COGAME_SAVE_REPLAY_URI", "file://" & work / (prefix & "-replay.json"))
   putEnv("COGAME_EVENTS_URI", "file://" & work / (prefix & "-events.jsonl"))
   putEnv("COGAME_PLAYER_FAILURE_URI", "file://" & work / (prefix & "-player-failure.json"))
+  putEnv("COGAME_SAVE_TRAJECTORY_URI", "file://" & work / (prefix & "-trajectory.jsonl"))
+  putEnv("COWORLD_EPISODE_ID", "test-" & prefix)
+  putEnv("COWORLD_GAME_VERSION", "0.0.0")
+  putEnv("COWORLD_SOURCE_REVISION", "test")
+  putEnv("COWORLD_GAME_NAME", "hive")
   var runtime = RuntimeConfig(host: "127.0.0.1", port: port, config: "{}")
   runtime.resultsUri = getEnv("COGAME_RESULTS_URI")
   runtime.replayUri = getEnv("COGAME_SAVE_REPLAY_URI")
@@ -347,46 +376,32 @@ proc main() =
 
   ## ---- nobody connects ---------------------------------------------------
   block noShow:
-    ## A seat that never connects reports the lowest offending slot to
-    ## COGAME_PLAYER_FAILURE_URI and terminates the unfinished episode unscored
-    ## (fault/host_error, null scores, null winner) with zero fabricated moves.
+    ## A seat that never connects publishes closed GamePlayerFailure to
+    ## COGAME_PLAYER_FAILURE_URI, omits results.json, retains diagnostics, and
+    ## exits nonzero with zero fabricated moves.
     let child = startProcess(self, options = {poParentStreams},
       env = {"HIVE_TEST_SERVER": "noshow", "HIVE_TEST_WORK": work,
              "PATH": getEnv("PATH")}.newStringTable)
     check(waitForHealth(curl, NoShowPort), "the no-show server answers /healthz")
-    let deadline = epochTime() + 90.0
-    while epochTime() < deadline and
-        not fileExists(work / "noshow-results.json"):
-      sleep(200)
+    let (exited, exitCode) = waitForExitBounded(child, 90.0)
+    check(exited, "the no-show server exits on its own")
+    check(exitCode != 0, "a no-show terminates with nonzero exit status")
     check(fileExists(work / "player_failure.json"),
       "a seat that never connects is reported to COGAME_PLAYER_FAILURE_URI")
     let failure = parseJson(readFile(work / "player_failure.json"))
-    checkEqual(failure["slot"].getInt(), 0,
-      "the LOWEST offending slot only")
-    check(failure["reason"].getStr().len > 0, "with a reason")
-    check(fileExists(work / "noshow-results.json"),
-      "the episode still writes results as the completion marker")
-    let results = parseJson(readFile(work / "noshow-results.json"))
-    checkEqual(results["reason"].getStr(), "fault",
-      "a no-show terminates the episode as fault")
-    checkEqual(results["end_rule"].getStr(), "host_error",
-      "end_rule is host_error")
-    checkEqual(results["winner"].kind, JNull, "no invented winner")
-    checkEqual(results["scores"].len, Colonies, "four score slots")
-    for seat in 0 ..< Colonies:
-      checkEqual(results["scores"][seat].kind, JNull,
-        "no numeric score on no-show fault")
-      checkEqual(results["win"][seat].getBool(), false,
-        "no invented win flag")
+    checkGamePlayerFailure(failure, 0, "player_error")
+    check(not fileExists(work / "noshow-results.json"),
+      "results.json is NOT written on an unscored no-show failure")
     let replay = parseJson(readFile(work / "noshow-replay.json"))
     checkEqual(replay["doctrines"].len, 0,
       "no fabricated doctrines are installed on a no-show")
+    checkEqual(replay["results"]["reason"].getStr(), "fault",
+      "diagnostic replay records fault reason")
+    checkEqual(replay["results"]["end_rule"].getStr(), "host_error",
+      "diagnostic replay records host_error")
     check(fileExists(work / "noshow-events.jsonl"),
       "the no-show episode writes its events")
-
-    child.terminate()
-    discard child.waitForExit()
-    report("a no-show is reported and terminates unscored with zero fabricated moves")
+    report("a no-show publishes GamePlayerFailure, omits results.json, and exits nonzero")
 
   block diagnosticsPrecedeTheCompletionMarker:
     # A FIFO blocks the final metric write until the parent deliberately
@@ -402,6 +417,13 @@ proc main() =
         discard child.waitForExit()
       check(condition, message)
     guardedCheck(waitForHealth(curl, ArtifactBarrierPort), "artifact barrier server answers health")
+    var barrierSockets: seq[WebSocket]
+    for slot in 0 ..< Colonies:
+      var socket = newWebSocket("ws://127.0.0.1:" & $ArtifactBarrierPort &
+        "/player?slot=" & $slot & "&token=t" & $slot)
+      socket.send($ %*{"type": "register", "prompt": "",
+        "scripted": "marcher", "policy": "m"})
+      barrierSockets.add(socket)
     let deadline = epochTime() + 20.0
     while epochTime() < deadline and not fileExists(work / "barrier-events.jsonl"):
       sleep(50)
@@ -415,6 +437,7 @@ proc main() =
     while epochTime() < deadline and not fileExists(work / "barrier-results.json"):
       sleep(50)
     guardedCheck(fileExists(work / "barrier-results.json"), "results publish only after diagnostics finish")
+    for socket in barrierSockets: socket.close()
     child.terminate()
     discard child.waitForExit()
     report("a blocked diagnostic sink prevents an early results completion marker")
@@ -422,7 +445,8 @@ proc main() =
   block roundTripInvalidAndAmbiguousObject:
     ## An external player sending an invalid/ambiguous action must be rejected
     ## with `accepted: false` + `cause: "parse_error"`, retried once, and then
-    ## terminate the unfinished episode unscored with zero fabricated moves.
+    ## terminate unscored with nonzero exit, no results.json, closed
+    ## GamePlayerFailure(player_error), and zero fabricated moves.
     let child = startProcess(self, options = {poParentStreams},
       env = {"HIVE_TEST_SERVER": "ext-reject", "HIVE_TEST_WORK": work,
              "PATH": getEnv("PATH")}.newStringTable)
@@ -459,37 +483,32 @@ proc main() =
       else: discard
     check(sawResult, "external player received decision_result")
     checkEqual(sawRejectCause, "parse_error", "rejection reports parse_error")
-    while epochTime() < deadline and not fileExists(work / "ext-results.json"):
-      sleep(100)
-    check(fileExists(work / "ext-results.json"), "ext-results.json written")
+    let (exited, exitCode) = waitForExitBounded(child, 30.0)
+    check(exited, "invalid-action server exits on its own")
+    check(exitCode != 0, "invalid external action exits nonzero")
+    check(not fileExists(work / "ext-results.json"),
+      "results.json is NOT written on invalid-action failure")
     check(fileExists(work / "ext-player-failure.json"),
       "COGAME_PLAYER_FAILURE_URI written for invalid action")
     let failure = parseJson(readFile(work / "ext-player-failure.json"))
-    checkEqual(failure["slot"].getInt(), 0, "failure reports offending slot 0")
-    check("parse_error" in failure["reason"].getStr(),
-      "failure reason names parse_error")
-    let results = parseJson(readFile(work / "ext-results.json"))
-    checkEqual(results["reason"].getStr(), "fault",
-      "invalid action terminates episode as fault")
-    checkEqual(results["end_rule"].getStr(), "host_error",
-      "end_rule is host_error")
-    checkEqual(results["winner"].kind, JNull, "no invented winner")
-    for seat in 0 ..< Colonies:
-      checkEqual(results["scores"][seat].kind, JNull,
-        "no numeric scores on invalid-action failure")
-      checkEqual(results["win"][seat].getBool(), false, "no win flag")
-    checkEqual(results["fallback_turns"][0].getInt(), 1,
-      "rejected external turn counted in fallback_turns")
-    checkEqual(results["fallback_causes"][0]["parse_error"].getInt(), 1,
-      "parse_error counted in fallback_causes")
+    checkGamePlayerFailure(failure, 0, "player_error")
+    check("parse_error" in failure["message"].getStr(),
+      "failure message names parse_error")
     let replay = parseJson(readFile(work / "ext-replay.json"))
     checkEqual(replay["doctrines"].len, 0,
       "zero fabricated doctrines installed on rejected turn")
+    let diagResults = replay["results"]
+    checkEqual(diagResults["reason"].getStr(), "fault",
+      "diagnostic replay records fault")
+    checkEqual(diagResults["end_rule"].getStr(), "host_error",
+      "diagnostic replay records host_error")
+    checkEqual(diagResults["fallback_turns"][0].getInt(), 1,
+      "rejected external turn counted in fallback_turns")
+    checkEqual(diagResults["fallback_causes"][0]["parse_error"].getInt(), 1,
+      "parse_error counted in fallback_causes")
     bad.close()
     for socket in others: socket.close()
-    child.terminate()
-    discard child.waitForExit()
-    report("invalid external action reports parse_error and terminates unscored")
+    report("invalid external action publishes GamePlayerFailure(player_error), omits results.json, and exits nonzero")
 
   block roundTripRegularAndFencedJson:
     ## Public host + player round-trip with regular JSON on turn 0 and
@@ -540,8 +559,9 @@ proc main() =
 
   block roundTripProviderFailure:
     ## Public host + player round-trip when the LLM provider returns HTTP 503:
-    ## terminates unscored (null scores, null winner), records provider_error,
-    ## writes COGAME_PLAYER_FAILURE_URI, and installs zero fabricated moves.
+    ## terminates unscored with nonzero exit, omits results.json, publishes
+    ## closed GamePlayerFailure(episode_inconclusive), retains private failure
+    ## diagnostics, and installs zero fabricated moves.
     let sidecar = startProcess(self, options = {poParentStreams},
       env = {"HIVE_TEST_SERVER": "fake-llm-503", "PATH": getEnv("PATH")}.newStringTable)
     check(waitForHealth(curl, LlmFailSidecarPort), "fake-llm-503 sidecar answers /healthz")
@@ -561,38 +581,61 @@ proc main() =
       ws.send($ %*{"type": "register", "prompt": "",
         "scripted": "marcher", "policy": "m"})
       sockets.add(ws)
-    let deadline = epochTime() + 30.0
-    while epochTime() < deadline and not fileExists(work / "llm-fail-results.json"):
-      sleep(100)
-    check(fileExists(work / "llm-fail-results.json"), "llm-fail-results.json written")
+    let (exited, exitCode) = waitForExitBounded(child, 30.0)
+    check(exited, "provider-failure server exits on its own")
+    check(exitCode != 0, "provider failure exits nonzero")
+    check(not fileExists(work / "llm-fail-results.json"),
+      "results.json is NOT written on provider failure")
     check(fileExists(work / "llm-fail-player-failure.json"),
       "COGAME_PLAYER_FAILURE_URI written on provider failure")
     let failure = parseJson(readFile(work / "llm-fail-player-failure.json"))
-    checkEqual(failure["slot"].getInt(), 0, "failure reports slot 0")
-    check("provider_error" in failure["reason"].getStr(),
-      "failure reason distinguishes provider_error")
-    let results = parseJson(readFile(work / "llm-fail-results.json"))
-    checkEqual(results["reason"].getStr(), "fault",
-      "provider failure terminates episode as fault")
-    checkEqual(results["end_rule"].getStr(), "host_error", "end_rule host_error")
-    checkEqual(results["winner"].kind, JNull, "no invented winner")
-    for seat in 0 ..< Colonies:
-      checkEqual(results["scores"][seat].kind, JNull,
-        "no numeric scores on provider failure")
-      checkEqual(results["win"][seat].getBool(), false, "no win flag")
-    checkEqual(results["fallback_causes"][0]["provider_error"].getInt(), 1,
-      "provider_error recorded in fallback_causes")
-    checkEqual(results["fallback_causes"][0]["parse_error"].getInt(), 0,
-      "provider failure is not misclassified as parse_error")
+    checkGamePlayerFailure(failure, 0, "episode_inconclusive")
+    check("provider_error" in failure["message"].getStr(),
+      "failure message distinguishes provider_error")
     let replay = parseJson(readFile(work / "llm-fail-replay.json"))
     checkEqual(replay["doctrines"].len, 0,
       "zero fabricated doctrines installed on provider failure")
+    let diagResults = replay["results"]
+    checkEqual(diagResults["reason"].getStr(), "fault",
+      "diagnostic replay records fault")
+    checkEqual(diagResults["end_rule"].getStr(), "host_error",
+      "diagnostic replay records host_error")
+    checkEqual(diagResults["fallback_causes"][0]["provider_error"].getInt(), 1,
+      "provider_error recorded in fallback_causes")
+    checkEqual(diagResults["fallback_causes"][0]["parse_error"].getInt(), 0,
+      "provider failure is not misclassified as parse_error")
+    check(fileExists(work / "llm-fail-trajectory.jsonl"),
+      "private failure diagnostics trajectory retained on provider failure")
+    let trajLines = readFile(work / "llm-fail-trajectory.jsonl").strip().splitLines()
+    check(trajLines.len >= 2, "trajectory has decision and terminal records")
+    let trajEnd = parseJson(trajLines[^1])
+    checkEqual(trajEnd["status"].getStr(), "failed",
+      "private trajectory records failed episode status")
     for ws in sockets: ws.close()
-    child.terminate()
-    discard child.waitForExit()
     sidecar.terminate()
     discard sidecar.waitForExit()
-    report("host+player round-trip terminates unscored on provider failure with no numeric scores")
+    report("host+player round-trip publishes GamePlayerFailure(episode_inconclusive), omits results.json, retains private diagnostics, and exits nonzero")
+
+  block playerFailureSchemaUnit:
+    let emptyErr = playerFailurePayload(2, "   ", pfkPlayerError)
+    checkGamePlayerFailure(emptyErr, 2, "player_error")
+    let longInc = playerFailurePayload(1, repeat("é", 2500), pfkEpisodeInconclusive)
+    checkGamePlayerFailure(longInc, 1, "episode_inconclusive")
+    checkEqual(longInc["message"].getStr().runeLen, 2000,
+      "overlong message truncates cleanly to 2000 runes")
+    checkEqual(playerFailureKindFor("no_credentials", false), pfkEpisodeInconclusive,
+      "no_credentials maps to episode_inconclusive")
+    checkEqual(playerFailureKindFor("provider_error", false), pfkEpisodeInconclusive,
+      "provider_error maps to episode_inconclusive")
+    checkEqual(playerFailureKindFor("transport_error", false), pfkEpisodeInconclusive,
+      "transport_error maps to episode_inconclusive")
+    checkEqual(playerFailureKindFor("parse_error", false), pfkPlayerError,
+      "parse_error maps to player_error")
+    checkEqual(playerFailureKindFor("timeout", true), pfkPlayerError,
+      "external timeout maps to player_error")
+    checkEqual(playerFailureKindFor("timeout", false), pfkEpisodeInconclusive,
+      "hosted LLM timeout maps to episode_inconclusive")
+    report("GamePlayerFailure payload enforces closed schema and rune bounds")
 
   ## ---- URI scheme rejection ----------------------------------------------
   block uriSchemes:
