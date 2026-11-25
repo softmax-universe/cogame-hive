@@ -42,8 +42,8 @@ model. The choice applies only to that seat, including its retries. Native
 900-output-token, temperature, turn, wall-clock and inference-budget limits
 remain in force. Registered IDs are ASCII and at most128 characters; invalid
 values are rejected rather than truncated. Direct Bedrock transport retains
-its configured profile selection and reports an explicit fallback for a
-per-seat override. Model choice is recorded in private original requests,
+its configured profile selection and reports an explicit `provider_error`
+failure for a per-seat override. Model choice is recorded in private original requests,
 not public actor observations or replay labels.
 
 To field a prompt policy, build `Dockerfile.ordinary-player` and set

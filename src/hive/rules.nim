@@ -60,10 +60,6 @@ proc scores*(match: Sim): array[Colonies, float] =
     running += result[seat]
   result[Colonies - 1] = 1.0 - running
 
-proc faultScores*(): array[Colonies, float] =
-  for seat in 0 ..< Colonies:
-    result[seat] = 0.25
-
 proc winnerSlot*(match: Sim): int =
   ## The slot index of the unique maximum, or -1 when the maximum is tied.
   var best = -1
@@ -96,10 +92,13 @@ proc endMatch*(match: Sim, reason: EndReason, rule: EndRule) =
   match.finished = true
   match.reason = reason
   match.rule = rule
-  let scored = if reason == erFault: faultScores() else: match.scores()
   var scoreJson = newJArray()
-  for value in scored:
-    scoreJson.add(%value)
+  if reason == erFault:
+    for seat in 0 ..< Colonies:
+      scoreJson.add(newJNull())
+  else:
+    for value in match.scores():
+      scoreJson.add(%value)
   var deliveredJson = newJArray()
   for seat in 0 ..< Colonies:
     deliveredJson.add(%match.delivered[match.seatNest[seat]])
@@ -167,8 +166,9 @@ proc resultsJson*(
 ): JsonNode =
   ## The closed results document. Adding or removing a key here means editing
   ## `coworld_manifest_template.json`'s `results_schema` in the same commit.
-  let scored = if match.reason == erFault: faultScores() else: match.scores()
-  let slot = if match.reason == erFault: -1 else: match.winnerSlot()
+  let unscored = match.reason == erFault
+  let scored = if unscored: default(array[Colonies, float]) else: match.scores()
+  let slot = if unscored: -1 else: match.winnerSlot()
   var
     namesJson = newJArray()
     aliases = newJArray()
@@ -194,8 +194,11 @@ proc resultsJson*(
     colours.add(%match.meadow.nests[colony].colour)
     nests.add(%[match.meadow.nests[colony].cx, match.meadow.nests[colony].cy])
     kinds.add(%(if seat < policyKinds.len: policyKinds[seat] else: "scripted"))
-    scoresJson.add(%scored[seat])
-    win.add(%(slot == seat))
+    if unscored:
+      scoresJson.add(newJNull())
+    else:
+      scoresJson.add(%scored[seat])
+    win.add(%(not unscored and slot == seat))
     delivered.add(%match.delivered[colony])
     harvested.add(%match.harvested[colony])
     raidedUnits.add(%match.raidedUnits[colony])

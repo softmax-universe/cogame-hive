@@ -232,8 +232,8 @@ def main() -> None:
 
     per_seat_int = {"type": "array", "items": {"type": "integer"},
                     "minItems": SEATS, "maxItems": SEATS}
-    per_seat_num = {"type": "array", "items": {"type": "number"},
-                    "minItems": SEATS, "maxItems": SEATS}
+    per_seat_score = {"type": "array", "items": {"type": ["number", "null"]},
+                      "minItems": SEATS, "maxItems": SEATS}
     per_seat_str = {"type": "array", "items": {"type": "string"},
                     "minItems": SEATS, "maxItems": SEATS}
     per_seat_bool = {"type": "array", "items": {"type": "boolean"},
@@ -249,7 +249,7 @@ def main() -> None:
                       "items": {"type": "array",
                                 "items": {"type": "integer"}}},
             "policy_kinds": per_seat_str,
-            "scores": per_seat_num,
+            "scores": per_seat_score,
             "win": per_seat_bool,
             "delivered": per_seat_int,
             "harvested": per_seat_int,
@@ -344,7 +344,7 @@ def main() -> None:
         "every keyframe. It contacts nothing but the S3 URL it was given.\n"
     )
 
-    def variant(vid, name, description, ticks, wall, bonanzas):
+    def variant(vid, name, description, ticks, wall, bonanzas, field_path="meadow"):
         return {
             "id": vid,
             "name": name,
@@ -359,7 +359,7 @@ def main() -> None:
                 "wallClockBudgetSeconds": wall,
                 "playerConnectTimeoutSeconds": 90,
                 "bonanzaTicks": bonanzas,
-                "fieldPath": "meadow",
+                "fieldPath": field_path,
             },
         }
 
@@ -414,11 +414,37 @@ def main() -> None:
                 ],
             },
         },
-        # Bundled player runnables live at the TOP level, and the certifier's
-        # `players-run` step requires every one of them to be seated by at
-        # least one certification slot - so hive ships exactly the one the
-        # fixture seats four times.
+        # Bundled player runnables live at the TOP level: the native model
+        # player is listed first (with PLAYER_PROMPT and no PLAYER_SCRIPTED),
+        # and the scripted marcher baseline is kept as a separate explicit ID
+        # used by offline certification.
         "player": [
+            {
+                "id": "llm",
+                "type": "player",
+                "name": "Hive Model Player",
+                "description": (
+                    "Native model-driven Hive player. Runs /bin/hive-player "
+                    "with PLAYER_PROMPT (and optional PLAYER_MODEL) so the "
+                    "colony sets one doctrine per turn from its private meadow "
+                    "view through the configured LLM transport, with no "
+                    "scripted fallback."
+                ),
+                "image": image,
+                "run": ["/bin/hive-player"],
+                "env": {
+                    "PLAYER_PROMPT": (
+                        "Build one road at a time and keep it alive. Open wide "
+                        "on turns 0-2 with high scouts and low trail_gain, then "
+                        "invert to low scouts, high trail_gain, high lay_food "
+                        "and focus on your best discovered cache. Keep "
+                        "lay_home >= 55 when working far from the nest, contest "
+                        "the centre bonanzas, and use recall for at most one "
+                        "turn if deliveries collapse."
+                    ),
+                },
+                "source_url": source_url,
+            },
             {
                 "id": "baseline",
                 "type": "player",
@@ -428,14 +454,13 @@ def main() -> None:
                     "a weak trail, inverts to a hard pump the moment a cache "
                     "shows up in its sources list, and recalls for one turn "
                     "when deliveries collapse. It reads its private view "
-                    "and sends one doctrine on each turn. The game uses "
-                    "marcher when a player misses its deadline."
+                    "and sends one doctrine on each turn."
                 ),
                 "image": image,
                 "run": ["/bin/hive-player"],
                 "env": {"PLAYER_SCRIPTED": "marcher"},
                 "source_url": source_url,
-            }
+            },
         ],
         "variants": [
             variant("default", "Meadow (4 colonies, 200 s)",
@@ -445,6 +470,11 @@ def main() -> None:
                     "A cheap ladder round: 2880 ticks, twelve turns, one "
                     "centre bonanza. Same four seats, same 24 ants.",
                     2880, 420, [1200]),
+            variant("crossroads", "Crossroads",
+                    "The full 4800-tick game on an alternate authored, "
+                    "mirror-symmetric corridor field. Rules, colonies, food "
+                    "and timing match the default variant.",
+                    4800, 660, [1200, 3600], field_path="crossroads"),
         ],
         "certification": {
             "players": [{"player_id": "baseline"} for _ in range(SEATS)],

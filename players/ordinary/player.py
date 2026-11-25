@@ -5,25 +5,53 @@ from __future__ import annotations
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import websocket
 from capture import Capture
-from policy import ScriptedPolicy, prompt_for
+from policy import ScriptedPolicy, parse_json_object, prompt_for
 from prompts import PromptSelection
+
+
+class RefusalError(RuntimeError):
+    """Model returned an explicit refusal stop_reason."""
+
+
+def classify_player_error(exc: BaseException) -> tuple[str, str]:
+    """Distinguish infrastructure/provider failures from invalid model output."""
+    if isinstance(exc, RefusalError):
+        return "refusal", str(exc) or "provider refusal"
+    if isinstance(exc, KeyError):
+        return "no_credentials", f"missing credential env: {exc}"
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code in (401, 403):
+            return "no_credentials", f"provider auth failed (http {exc.code})"
+        if exc.code == 429:
+            return "throttled", "provider throttled (http 429)"
+        return "provider_error", f"provider http {exc.code}"
+    if isinstance(exc, TimeoutError):
+        return "timeout", str(exc) or "provider request timed out"
+    if isinstance(exc, (urllib.error.URLError, OSError)):
+        return "transport_error", str(exc)
+    return "parse_error", str(exc)
 
 
 def choose(
     turn: dict, generator, marcher: ScriptedPolicy, driftling: ScriptedPolicy, strategy: str, scripted: str
 ) -> tuple[dict, str, str, str]:
     view = turn["view"]
-    candidates = [marcher.decide(view), driftling.decide(view)]
     selection = PromptSelection.model_validate(turn["prompt_selection"])
     system, user = prompt_for(view, strategy, selection)
     if scripted:
-        return candidates[1 if scripted == "driftling" else 0], "scripted", system, user
+        kind = scripted.strip().lower()
+        if kind == "marcher":
+            return marcher.decide(view), "scripted", system, user
+        if kind == "driftling":
+            return driftling.decide(view), "scripted", system, user
+        raise ValueError(f"unknown PLAYER_SCRIPTED baseline: {scripted}")
     if generator:
         completion = generator(
             [
@@ -31,9 +59,7 @@ def choose(
                 {"role": "user", "content": user},
             ]
         )
-        action = json.loads(completion)
-        if not isinstance(action, dict):
-            raise ValueError("trained Hive decision must be a JSON object")
+        action = parse_json_object(completion)
         return action, "trained", system, user
     if strategy:
         endpoint = os.environ.get("COWORLD_LLM_ENDPOINT", "").rstrip("/")
@@ -56,9 +82,17 @@ def choose(
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=10) as response:
-            action = json.loads(json.load(response)["content"][0]["text"])
+            payload = json.load(response)
+            if payload.get("stop_reason") == "refusal":
+                raise RefusalError("anthropic refusal")
+            text = "".join(
+                block.get("text", "")
+                for block in payload.get("content", [])
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+            action = parse_json_object(text)
         return action, "llm", system, user
-    return candidates[0], "scripted", system, user
+    raise ValueError("ordinary player requires PLAYER_SCRIPTED, PLAYER_PROMPT, or HIVE_ADAPTER_DIR")
 
 
 def main() -> None:
@@ -96,7 +130,7 @@ def main() -> None:
             time.sleep(0.25)
     socket.settimeout(120)
     socket.send(registration)
-    pending: dict[int, tuple[str, str, dict, str]] = {}
+    pending: dict[int, tuple[str, str, dict | None, str, str, str]] = {}
     while True:
         opcode, data = socket.recv_data(control_frame=True)
         if opcode == websocket.ABNF.OPCODE_CLOSE:
@@ -105,7 +139,7 @@ def main() -> None:
             continue
         frame = json.loads(data)
         if "done" in frame:
-            if pending:
+            if pending and frame.get("result", {}).get("reason") != "fault":
                 raise RuntimeError("Hive ended with unacknowledged decisions")
             if artifact:
                 artifact.upload(frame["result"]["scores"], frame["result"]["reason"])
@@ -115,14 +149,25 @@ def main() -> None:
             selection = PromptSelection.model_validate(frame["prompt_selection"])
             socket.send(registration)
         elif kind == "decision_request":
-            if frame["turn"] not in pending:
-                action, source, system, user = choose(frame, generator, marcher, driftling, strategy, scripted)
-                pending[frame["turn"]] = (system, user, action, source)
-            _, _, action, source = pending[frame["turn"]]
-            socket.send(json.dumps({"type": "decision", "turn": frame["turn"], "action": action, "source": source}))
+            if frame["turn"] not in pending or frame.get("retry"):
+                try:
+                    action, source, system, user = choose(frame, generator, marcher, driftling, strategy, scripted)
+                    pending[frame["turn"]] = (system, user, action, source, "", "")
+                except (ValueError, json.JSONDecodeError, OSError, KeyError, RefusalError) as exc:
+                    if backend == "scripted":
+                        raise
+                    cause, detail = classify_player_error(exc)
+                    print(f"Hive ordinary player failed on turn {frame['turn']} ({cause}): {detail}", flush=True)
+                    pending[frame["turn"]] = ("", "", None, backend, cause, detail)
+            _, _, action, source, cause, detail = pending[frame["turn"]]
+            reply: dict[str, object] = {"type": "decision", "turn": frame["turn"], "action": action, "source": source}
+            if action is None and cause:
+                reply["cause"] = cause
+                reply["detail"] = detail[:200]
+            socket.send(json.dumps(reply))
         elif kind == "decision_result":
-            system, user, action, source = pending.pop(frame["turn"])
-            if artifact and frame["accepted"]:
+            system, user, action, source, _, _ = pending.pop(frame["turn"])
+            if artifact and frame["accepted"] and action is not None:
                 artifact.record(system, user, action, source, frame["turn"], selection.metadata(system, user))
     socket.close()
     print(f"Hive ordinary player finished: slot={slot} backend={backend}", flush=True)

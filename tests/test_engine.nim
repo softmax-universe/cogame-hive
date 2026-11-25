@@ -266,11 +266,8 @@ proc main() =
     checkEqual(records[0].size, Colonies, "the first batch holds all four")
     checkEqual(records[1].size, Colonies, "the retry re-batches all four")
     for seat in 0 ..< Colonies:
-      checkEqual($outcomes[seat].resolved.source, "fallback",
-        "two failures land on the scripted fallback")
       checkEqual(outcomes[seat].cause, "parse_error", "cause is parse_error")
-      check(outcomes[seat].resolved.doctrine.isLegal(),
-        "the fallback doctrine is legal")
+      checkEqual(outcomes[seat].attempts, 2, "two attempts are recorded")
     for body in records[0].bodies:
       check(RetryHint notin body, "the first attempt carries no hint")
     for body in records[1].bodies:
@@ -280,7 +277,7 @@ proc main() =
     ## is "well under that", with room for a slow debug build.
     check(records[1].opened - records[0].closed < 0.9,
       "a parse failure is retried without a backoff")
-    report("tolerant parse, exactly one retry, then the marcher doctrine")
+    report("strict parse, exactly one retry, then parse_error failure with no fabricated move")
 
   block throttledIsNotAParseError:
     ## #4: every sidecar failure the league saw was a 429 or a 503, and
@@ -301,9 +298,6 @@ proc main() =
     checkEqual(records[1].size, Colonies, "the retry re-batches all four")
     for seat in 0 ..< Colonies:
       checkEqual(outcomes[seat].cause, "throttled", "the cause is throttled")
-      checkEqual($outcomes[seat].resolved.source, "fallback", "it fell back")
-      check(outcomes[seat].resolved.doctrine.isLegal(),
-        "the fallback doctrine is legal")
       checkEqual(outcomes[seat].attempts, 2, "two attempts are recorded")
       check("429" in outcomes[seat].detail, "detail keeps the 429 text")
       check(outcomes[seat].detail.runeLen <= MaxDetailRunes,
@@ -339,9 +333,7 @@ proc main() =
     for seat in 0 ..< Colonies:
       checkEqual(outcomes[seat].cause, "provider_error",
         "the cause is provider_error")
-      checkEqual($outcomes[seat].resolved.source, "fallback", "it fell back")
-      check(outcomes[seat].resolved.doctrine.isLegal(),
-        "the fallback doctrine is legal")
+      checkEqual(outcomes[seat].attempts, 2, "two attempts are recorded")
       check("unavailable" in outcomes[seat].detail, "detail keeps the body")
     for body in records[1].bodies:
       check(RetryHint notin body, "no invalid-reply hint after a 503")
@@ -364,9 +356,7 @@ proc main() =
     checkEqual(records.len, 2, "a refusal is retried exactly once")
     for seat in 0 ..< Colonies:
       checkEqual(outcomes[seat].cause, "refusal", "the cause is refusal")
-      checkEqual($outcomes[seat].resolved.source, "fallback", "it fell back")
-      check(outcomes[seat].resolved.doctrine.isLegal(),
-        "the fallback doctrine is legal")
+      checkEqual(outcomes[seat].attempts, 2, "two attempts are recorded")
     for body in records[1].bodies:
       check(RetryHint notin body, "a refusal is not an invalid reply")
     check(records[1].opened - records[0].closed < 0.9,
@@ -448,7 +438,7 @@ proc main() =
       $elapsed.int & "s)")
     for seat in 0 ..< Colonies:
       checkEqual(outcomes[seat].cause, "timeout", "the cause is timeout")
-      checkEqual($outcomes[seat].resolved.source, "fallback", "it fell back")
+      checkEqual(outcomes[seat].attempts, 2, "two attempts are recorded")
     report("a hung client is bounded by the two attempt deadlines")
 
   block outerPerTurnDeadline:
@@ -475,11 +465,8 @@ proc main() =
     check(elapsed < 3.0,
       "the turn returns inside its own budget (took " & $elapsed & "s)")
     for seat in 0 ..< Colonies:
-      checkEqual($outcomes[seat].resolved.source, "fallback",
-        "every seat lands on the scripted fallback")
       checkEqual(outcomes[seat].cause, "timeout", "with cause timeout")
-      check(outcomes[seat].resolved.doctrine.isLegal(),
-        "and the fallback doctrine is legal")
+      check(outcomes[seat].attempts >= 1, "attempt count recorded")
     report("an outer per-turn deadline bounds the turn on its own")
 
   block bedrockLadderAdvancesOn403:
@@ -508,14 +495,14 @@ proc main() =
       "four simultaneous 403s are ONE verdict on ONE candidate, so the " &
       "three-rung ladder is not exhausted by a single batch")
     for seat in 0 ..< Colonies:
-      checkEqual($first[seat].resolved.source, "fallback",
-        "the turn still falls back so no colony is unactuated")
+      checkEqual(first[seat].cause, "provider_error",
+        "first call reports provider_error with no fabricated doctrine")
     let second = client.decideAll(match, promptsAll("go"), scripted, memory, 1, PromptSelection())
     check(client.disabled,
       "only when the LAST candidate 403s is the client disabled")
     for seat in 0 ..< Colonies:
-      check(second[seat].resolved.doctrine.isLegal(),
-        "and every seat still gets a legal doctrine")
+      checkEqual(second[seat].cause, "no_credentials",
+        "exhausted 403 ladder reports no_credentials")
     report("a 403 advances the bedrock candidate, whatever the body says")
 
   block budgetGuardSettlesEarly:
@@ -597,27 +584,27 @@ proc main() =
     let results = resultsJson(match, @["a", "b", "c", "d"],
       @["llm", "llm", "scripted", "scripted"], turnsLlm, fallbackTurns, causes)
     for seat in 0 ..< Colonies:
-      checkEqual(results["scores"][seat].getFloat(), 0.25,
-        "a fault scores 0.25 for every seat")
+      checkEqual(results["scores"][seat].kind, JNull,
+        "a fault leaves every seat unscored (null)")
     let partial = buildReplay(match, @["a", "b", "c", "d"],
       @["llm", "llm", "scripted", "scripted"], results)
     check(partial["keyframes"].len > 0, "a partial replay is still written")
     checkEqual(partial["results"]["reason"].getStr(), "fault",
       "and it carries the fault")
     discard parseReplayBytes($partial)
-    report("a sim fault scores 0.25 everywhere and still writes a replay")
+    report("a sim fault terminates unscored and still writes a partial replay")
 
-  block unregisteredSeatPlaysMarcher:
+  block unregisteredSeatDoesNotPlayMarcher:
     var seats = initRoster(@["t0", "t1", "t2", "t3"])
     for seat in 0 ..< Colonies:
-      checkEqual(seats.seats[seat].scripted, skMarcher,
-        "a seat that never registers defaults to the marcher")
-      checkEqual(seats.seats[seat].policyKind(), "scripted",
-        "and is reported as scripted")
+      checkEqual(seats.seats[seat].scripted, skNone,
+        "a seat that never registers does not silently default to marcher")
       check(not seats.seats[seat].everConnected, "and never connected")
-    seats.register(0, "", "")
+    seats.register(0, "marcher", "")
     checkEqual(seats.seats[0].scripted, skMarcher,
-      "registering with neither field is also the marcher")
+      "registering with marcher selects the marcher baseline")
+    checkEqual(seats.seats[0].policyKind(), "scripted",
+      "and is reported as scripted")
     seats.register(1, "", "my-policy", true)
     checkEqual(seats.seats[1].scripted, skNone, "a player chooses its policy")
     checkEqual(seats.seats[1].policyKind(), "external", "reported as external")
@@ -628,9 +615,15 @@ proc main() =
       "an ordinary player is registered as an external doctrine source")
     checkEqual(seats.seats[3].scripted, skNone,
       "an external seat does not become a scripted seat")
-    report("an unregistered seat plays the marcher for the whole match")
+    var rejected = false
+    try:
+      seats.register(0, "true", "")
+    except HiveError:
+      rejected = true
+    check(rejected, "legacy scripted alias is rejected on registration")
+    report("unregistered seats do not silently play marcher and legacy aliases are rejected")
 
-  block disconnectDegradesAndRevives:
+  block disconnectAndAuth:
     var seats = initRoster(@["t0", "t1", "t2", "t3"])
     seats.register(0, "", "", true)
     checkEqual(seats.authorize(0, "t0"), jeNone, "a good token is accepted")
@@ -639,16 +632,12 @@ proc main() =
       "a duplicate connection is refused")
     checkEqual(seats.authorize(0, "wrong"), jeBadToken, "a bad token is refused")
     checkEqual(seats.authorize(9, "t0"), jeBadSlot, "a bad slot is refused")
-    ## The server's rule: a disconnected seat degrades to the marcher.
-    proc effective(seat: Seat): ScriptKind =
-      if seat.connected: seat.scripted else: skMarcher
-    checkEqual(effective(seats.seats[0]), skNone, "connected: the player plays")
     seats.seats[0].connected = false
-    checkEqual(effective(seats.seats[0]), skMarcher,
-      "disconnected: the doctrine source degrades to the marcher")
+    checkEqual(seats.seats[0].scripted, skNone,
+      "disconnected external seat does not become a scripted baseline")
     seats.seats[0].connected = true
-    checkEqual(effective(seats.seats[0]), skNone, "and revives on reconnect")
-    report("a mid-match disconnect degrades to the marcher and revives")
+    checkEqual(seats.seats[0].scripted, skNone, "and revives on reconnect")
+    report("auth rules hold and disconnect does not silently substitute marcher")
 
   block policyRuneCap:
     var seats = initRoster(@["t0", "t1", "t2", "t3"])

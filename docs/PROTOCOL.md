@@ -19,9 +19,10 @@ connection on a live slot is **409**.
 
 `src/hive_player.nim` reads `COWORLD_PLAYER_WS_URL`, `PLAYER_SCRIPTED` and
 `PLAYER_POLICY_LABEL`, sends that frame, then answers each `decision_request`
-from its private view. A seat that never connects plays the game fallback.
-`PLAYER_SCRIPTED` parsing: `marcher` / `1` / `true` / `yes` → marcher,
-`driftling` → driftling, anything else → none.
+from its private view. A seat that never connects is reported to
+`COGAME_PLAYER_FAILURE_URI` and terminates the episode unscored instead of
+running a substitute or scripted baseline. `PLAYER_SCRIPTED` accepts exact
+baseline names only: `marcher`, `driftling`, or empty.
 
 Released `hive.player.v1` players may instead register a `prompt` string
 (at most 4000 runes). The game resolves those doctrines through the hosted
@@ -30,9 +31,9 @@ selects that seat's model for both initial and retry requests; omission retains
 the game default. It must be at most128 ASCII characters from letters, digits,
 `-`, `_`, `.`, `/` and `:`. The bundled player's `PLAYER_MODEL` emits this field
 only alongside `PLAYER_PROMPT`. Existing output and time limits remain fixed.
-Model IDs never enter public observations or replay events. Direct Bedrock
-profile rotation remains global; a per-seat override on that transport produces
-an explicit provider-error fallback. A named script plus the v1
+Model IDs never enter public observations or replay events. Direct Bedrock profile rotation remains global; a per-seat override on that
+transport produces an explicit `provider_error` failure and terminates the
+episode unscored. A named script plus the v1
 `prompt` field runs directly in the game. Prompts never enter replays.
 Registrations without a `prompt` field select ordinary decisions;
 their strategy stays inside the player container.
@@ -49,11 +50,15 @@ configured prompt or trained backend. Each returns one JSON text frame:
  "source":"scripted"}
 ```
 
-The game parses and repairs the action using its existing doctrine parser,
-then records it in the replay. It sends `decision_result` with an `accepted`
-boolean before the informational `turn` frame. Missing or invalid decisions
-are retried once, then fall back to marcher. All requests are sent before the
-game waits for any seat. The game never receives an inference credential.
+The game strictly validates the action using its doctrine parser, then records
+it in the replay. It sends `decision_result` with an `accepted` boolean (plus
+`cause` and `detail` when rejected) before the informational `turn` frame.
+Missing or invalid decisions are retried once; if still missing or invalid, the
+server records the failure cause, reports the offending slot to
+`COGAME_PLAYER_FAILURE_URI`, and terminates the unfinished episode unscored
+(`fault` / `host_error`, `scores: [null, null, null, null]`, `winner: null`)
+with no fabricated substitute doctrine. All requests are sent before the game
+waits for any seat. The game never receives an inference credential.
 
 ### game → player
 
@@ -134,27 +139,29 @@ names any prompt, view or event body contains.
 
 ## Doctrine schema
 
-| Field | Type | Legal values | Repair when violated |
+| Field | Type | Required | Legal values / default |
 |---|---|---|---|
-| `scouts` | int | 0…100 | missing/non-numeric → previous turn's value, or 40 on turn 0; out of range → clamped |
-| `trail_gain` | int | 0…100 | as `scouts`, default 50 |
-| `poach` | int | 0…100 | as `scouts`, default 15 |
-| `spread` | int | 0…100 | as `scouts`, default 40 |
-| `lay_food` | int | 0…100 | as `scouts`, default 70 |
-| `lay_home` | int | 0…100 | as `scouts`, default 50 |
-| `recall` | bool | `true`/`false`; accepts `"true"`/`"false"`/`0`/`1` | → `false`. Forced `false` if the previous turn recalled |
-| `focus` | `[int,int]` or null | `bx ∈ 0…19`, `by ∈ 0…10` | out of range → clamped; wrong shape → `null` |
-| `focus_weight` | int | 0…100 | as `scouts`, default 0; forced 0 when `focus` is `null` |
-| `note` | string | ≤ 140 **runes** | truncated on a rune boundary |
-| `say` | string | ≤ 32 **runes** | truncated on a rune boundary |
+| `scouts` | int | yes | `0…100` |
+| `trail_gain` | int | yes | `0…100` |
+| `poach` | int | yes | `0…100` |
+| `spread` | int | yes | `0…100` |
+| `lay_food` | int | yes | `0…100` |
+| `lay_home` | int | yes | `0…100` |
+| `recall` | bool | no | `true`/`false`, default `false`. Forced `false` if the previous turn recalled |
+| `focus` | `[int,int]` or `null` | no | `bx ∈ 0…19`, `by ∈ 0…10`, default `null` |
+| `focus_weight` | int | no | `0…100`, default `0`; must be `0` when `focus` is `null` |
+| `note` | string | no | default `""`, ≤ 140 **runes** (truncated on a rune boundary) |
+| `say` | string | no | default `""`, ≤ 32 **runes** (truncated on a rune boundary) |
 
-Parsing is tolerant: markdown fences are stripped, the outermost balanced
-`{…}` is taken if the model prefixed prose, numeric strings are accepted for
-any integer field, `focus` may be `{"bx":…,"by":…}`, and percentages may be
-written `"70%"`. Only when no object carrying at least one recognised doctrine
-key can be recovered does the retry, then the fallback, fire. **The resolved,
-repaired, clamped doctrine is what is installed and what is recorded** — the
-replay never depends on re-running the repair.
+Model replies requesting JSON must contain **exactly one JSON object**, either
+bare or inside a single ordinary outer Markdown code fence (plain `` ``` `` or
+`` ```json ``). Surrounding prose, extra JSON objects, duplicate keys, unknown
+fields, out-of-range values, numeric/percentage strings, floats, and legacy
+field shapes (such as `focus: {"bx":…,"by":…}`) are rejected and trigger the
+single retry; a second failure records the diagnostic `fallback` event, reports
+the offending slot to `COGAME_PLAYER_FAILURE_URI`, and terminates the episode
+unscored (`fault` / `host_error`, `scores: [null, null, null, null]`,
+`winner: null`). **The validated doctrine is what is installed and what is recorded.**
 
 Three further caps on strings that reach the replay: `register.policy`
 ≤ 48 runes, any recorded error text (`fallback.detail`) ≤ 200 runes, and
@@ -196,7 +203,8 @@ All per-seat arrays are length 4 in **slot** order.
 
 `reason` is one of `complete` / `deadline` / `fault`; `end_rule` is one of
 `full_time` / `wall_clock` / `sim_fault` / `host_error`. `winner` is a slot
-index `0…3` or `null`.
+index `0…3` or `null`. On `fault`, `scores` is `[null, null, null, null]`,
+`win` is `[false, false, false, false]`, and `winner` is `null`.
 
 `fallback_causes[seat]` is a histogram over the `fallback.cause` enum, one
 integer per cause. Key order is append-only, so a reader that knows only the
